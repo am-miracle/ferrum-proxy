@@ -1,0 +1,18 @@
+server:
+  port: 8080
+  host: 0.0.0.0
+
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+      - http://127.0.0.1:3002
+      - http://127.0.0.1:3003
+
+  - path_prefix: /static
+    backends:
+      - http://127.0.0.1:4000
+
+health_check:
+  interval_sec: 10
+  endpoint: /health
