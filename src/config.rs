@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -110,6 +111,13 @@ impl ServerConfig {
         }
 
         Ok(())
+    }
+
+    pub fn socket_addr(&self) -> Result<SocketAddr, ConfigError> {
+        let addr = format!("{}:{}", self.host, self.port);
+        addr.parse().map_err(|err| {
+            ConfigError::Validation(format!("server host/port must form a valid socket address: {err}"))
+        })
     }
 }
 
@@ -266,5 +274,26 @@ health_check:
         );
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn builds_socket_address_from_server_config() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 127.0.0.1
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+health_check:
+  interval_sec: 10
+  endpoint: /health
+"#,
+        );
+
+        let addr = config.server.socket_addr().expect("socket addr should parse");
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
     }
 }
