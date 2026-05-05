@@ -1,5 +1,10 @@
+mod balancing;
 mod config;
+mod health;
+mod http;
+mod routing;
 mod server;
+mod upstream;
 
 use config::Config;
 

@@ -6,26 +6,26 @@ use std::path::Path;
 use serde::Deserialize;
 use url::Url;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     pub routes: Vec<RouteConfig>,
     pub health_check: HealthCheckConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
     pub port: u16,
     pub host: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RouteConfig {
     pub path_prefix: String,
     pub backends: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct HealthCheckConfig {
     pub interval_sec: u64,
     pub endpoint: String,
@@ -116,7 +116,9 @@ impl ServerConfig {
     pub fn socket_addr(&self) -> Result<SocketAddr, ConfigError> {
         let addr = format!("{}:{}", self.host, self.port);
         addr.parse().map_err(|err| {
-            ConfigError::Validation(format!("server host/port must form a valid socket address: {err}"))
+            ConfigError::Validation(format!(
+                "server host/port must form a valid socket address: {err}"
+            ))
         })
     }
 }
