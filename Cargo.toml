@@ -9,5 +9,5 @@ hyper = { version = "1.9.0", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 url = "2"

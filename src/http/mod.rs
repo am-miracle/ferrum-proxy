@@ -6,7 +6,7 @@ use hyper::{Method, Request, Response, StatusCode};
 
 use crate::balancing::RoundRobinBalancer;
 use crate::config::Config;
-use crate::health::HealthManager;
+use crate::health::{spawn_active_checks, HealthManager};
 use crate::routing::match_route;
 use crate::upstream::{bad_gateway_response, UpstreamClient};
 
@@ -29,6 +29,10 @@ impl AppState {
             health,
             upstream: UpstreamClient::new(),
         }
+    }
+
+    pub fn spawn_background_tasks(&self) {
+        spawn_active_checks(self.config.clone(), self.health.clone());
     }
 }
 
@@ -61,8 +65,19 @@ where
     };
 
     match state.upstream.forward(backend, request).await {
-        Ok(response) => response,
-        Err(err) => bad_gateway_response(&err),
+        Ok(response) => {
+            if response.status().is_server_error() {
+                state.health.record_failure(backend);
+            } else {
+                state.health.record_success(backend);
+            }
+
+            response
+        }
+        Err(err) => {
+            state.health.record_failure(backend);
+            bad_gateway_response(&err)
+        }
     }
 }
 
@@ -74,6 +89,7 @@ fn handle_internal_route(
     match (method, path) {
         (&Method::GET, "/") => Some(root_response(state)),
         (&Method::GET, "/health") => Some(text_response(StatusCode::OK, "ok\n")),
+        (&Method::GET, "/health/backends") => Some(backend_health_response(state)),
         _ => None,
     }
 }
@@ -84,6 +100,19 @@ fn root_response(state: &AppState) -> Response<Full<Bytes>> {
         StatusCode::OK,
         format!("ferrum-proxy is running with {route_count} configured route(s)\n"),
     )
+}
+
+fn backend_health_response(state: &AppState) -> Response<Full<Bytes>> {
+    let body = state
+        .health
+        .backend_statuses()
+        .into_iter()
+        .map(|(backend, healthy)| {
+            format!("{backend} {}\n", if healthy { "healthy" } else { "unhealthy" })
+        })
+        .collect::<String>();
+
+    text_response(StatusCode::OK, body)
 }
 
 fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
@@ -146,6 +175,31 @@ mod tests {
         let response = handle_request(request, sample_state()).await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn backend_health_endpoint_reports_current_status() {
+        let state = state_with_api_backends(&["http://127.0.0.1:3002", "http://127.0.0.1:3001"]);
+        state.health.record_failure("http://127.0.0.1:3002");
+        state.health.record_failure("http://127.0.0.1:3002");
+        state.health.record_failure("http://127.0.0.1:3002");
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/health/backends")
+            .body(empty_body())
+            .unwrap();
+        let response = handle_request(request, state).await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            Bytes::from_static(
+                b"http://127.0.0.1:3001 healthy\nhttp://127.0.0.1:3002 unhealthy\nhttp://127.0.0.1:4000 healthy\n"
+            )
+        );
     }
 
     #[tokio::test]
@@ -323,6 +377,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passive_failures_mark_backend_unhealthy_and_skip_it() {
+        let healthy: String = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from_static(b"healthy-backend")))
+                .unwrap()
+        })
+        .await;
+
+        let failing_backend = "http://127.0.0.1:9";
+        let state = state_with_api_backends(&[failing_backend, healthy.as_str()]);
+
+        let first_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(first_response.status(), StatusCode::BAD_GATEWAY);
+
+        let second_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        let second_body = second_response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(second_body, Bytes::from_static(b"healthy-backend"));
+
+        let third_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(third_response.status(), StatusCode::BAD_GATEWAY);
+
+        let fourth_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        let fourth_body = fourth_response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(fourth_body, Bytes::from_static(b"healthy-backend"));
+
+        let fifth_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(fifth_response.status(), StatusCode::BAD_GATEWAY);
+
+        let sixth_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state,
+        )
+        .await;
+        let sixth_body = sixth_response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(sixth_body, Bytes::from_static(b"healthy-backend"));
+    }
+
+    #[tokio::test]
+    async fn passive_server_errors_mark_backend_unhealthy_and_skip_it() {
+        let failing: String = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from_static(b"boom")))
+                .unwrap()
+        })
+        .await;
+        let healthy: String = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from_static(b"healthy-backend")))
+                .unwrap()
+        })
+        .await;
+
+        let state = state_with_api_backends(&[failing.as_str(), healthy.as_str()]);
+
+        let first_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(first_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let second_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        let second_body = second_response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(second_body, Bytes::from_static(b"healthy-backend"));
+
+        let third_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(third_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let fourth_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        let fourth_body = fourth_response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(fourth_body, Bytes::from_static(b"healthy-backend"));
+
+        let fifth_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(fifth_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let sixth_response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state,
+        )
+        .await;
+        let sixth_body = sixth_response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(sixth_body, Bytes::from_static(b"healthy-backend"));
+    }
+
+    #[tokio::test]
     async fn skips_unhealthy_backends_during_round_robin() {
         let first: String = spawn_test_upstream(|_| async move {
             Response::builder()
@@ -340,7 +568,9 @@ mod tests {
         .await;
 
         let state = state_with_api_backends(&[first.as_str(), second.as_str()]);
-        state.health.mark_backend_unhealthy(first.as_str());
+        state.health.record_failure(first.as_str());
+        state.health.record_failure(first.as_str());
+        state.health.record_failure(first.as_str());
 
         let response = handle_request(
             Request::builder()
@@ -367,7 +597,9 @@ mod tests {
         .await;
 
         let state = state_with_api_backends(&[first.as_str()]);
-        state.health.mark_backend_unhealthy(first.as_str());
+        state.health.record_failure(first.as_str());
+        state.health.record_failure(first.as_str());
+        state.health.record_failure(first.as_str());
 
         let response = handle_request(
             Request::builder()

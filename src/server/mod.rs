@@ -9,6 +9,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let addr = config.server.socket_addr()?;
     let route_count = config.routes.len();
     let state = AppState::new(config);
+    state.spawn_background_tasks();
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     println!("Listening on http://{addr} with {route_count} configured route(s)");
