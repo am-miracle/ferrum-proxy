@@ -14,12 +14,14 @@ use tokio::time;
 use url::Url;
 
 use crate::config::{Config, RouteConfig};
+use crate::telemetry::Telemetry;
 
 const FAILURE_THRESHOLD: usize = 3;
 const RECOVERY_THRESHOLD: usize = 2;
 
 pub struct HealthManager {
     backend_health: HashMap<String, BackendHealth>,
+    telemetry: Option<Arc<Telemetry>>,
 }
 
 struct BackendHealth {
@@ -29,18 +31,26 @@ struct BackendHealth {
 }
 
 impl HealthManager {
+    #[cfg(test)]
     pub fn new(routes: &[RouteConfig]) -> Self {
+        Self::with_telemetry(routes, None)
+    }
+
+    pub fn with_telemetry(routes: &[RouteConfig], telemetry: Option<Arc<Telemetry>>) -> Self {
         let mut backend_health = HashMap::new();
 
         for route in routes {
             for backend in &route.backends {
                 backend_health
                     .entry(backend.clone())
-                    .or_insert_with(BackendHealth::healthy);
+                    .or_insert_with(BackendHealth::healthy); // shared across routes if the same URL appears in multiple
             }
         }
 
-        Self { backend_health }
+        Self {
+            backend_health,
+            telemetry,
+        }
     }
 
     pub fn healthy_backends<'a>(&self, route: &'a RouteConfig) -> Vec<&'a str> {
@@ -77,25 +87,42 @@ impl HealthManager {
 
     pub fn record_success(&self, backend: &str) {
         if let Some(state) = self.backend_health.get(backend) {
-            state.consecutive_failures.store(0, Ordering::Relaxed);
+            state.consecutive_failures.store(0, Ordering::Relaxed); // any success resets the failure streak
             let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
 
             if !state.healthy.load(Ordering::Relaxed) && successes >= RECOVERY_THRESHOLD {
                 state.healthy.store(true, Ordering::Relaxed);
                 state.consecutive_successes.store(0, Ordering::Relaxed);
+                self.record_transition(backend, "unhealthy", "healthy", "success_threshold");
             }
         }
     }
 
     pub fn record_failure(&self, backend: &str) {
         if let Some(state) = self.backend_health.get(backend) {
-            state.consecutive_successes.store(0, Ordering::Relaxed);
+            state.consecutive_successes.store(0, Ordering::Relaxed); // any failure resets the success streak
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record_backend_failure(backend);
+            }
             let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
             if state.healthy.load(Ordering::Relaxed) && failures >= FAILURE_THRESHOLD {
                 state.healthy.store(false, Ordering::Relaxed);
                 state.consecutive_failures.store(0, Ordering::Relaxed);
+                self.record_transition(backend, "healthy", "unhealthy", "failure_threshold");
             }
+        }
+    }
+
+    fn record_transition(
+        &self,
+        backend: &str,
+        from: &'static str,
+        to: &'static str,
+        reason: &'static str,
+    ) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_health_transition(backend, from, to, reason);
         }
     }
 }
@@ -162,7 +189,7 @@ async fn probe_backend(
 
     match client.request(request).await {
         Ok(response) => response.status(),
-        Err(_) => StatusCode::BAD_GATEWAY,
+        Err(_) => StatusCode::BAD_GATEWAY, // unreachable = unhealthy
     }
 }
 
@@ -178,9 +205,10 @@ fn build_healthcheck_uri(backend: &str, endpoint: &str) -> Result<Uri, url::Pars
     Ok(url
         .as_str()
         .parse()
-        .expect("health check URI should be valid after config validation"))
+        .expect("invalid health check URI"))
 }
 
+// a backend may appear in multiple routes; probe it once per cycle
 fn unique_backends(routes: &[RouteConfig]) -> Vec<String> {
     let mut backends = HashSet::new();
 
@@ -355,6 +383,7 @@ mod tests {
                 interval_sec: 1,
                 endpoint: "/health".to_string(),
             },
+            upstream: crate::config::UpstreamConfig::default(),
         }
     }
 

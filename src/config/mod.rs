@@ -11,6 +11,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub routes: Vec<RouteConfig>,
     pub health_check: HealthCheckConfig,
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -29,6 +31,14 @@ pub struct RouteConfig {
 pub struct HealthCheckConfig {
     pub interval_sec: u64,
     pub endpoint: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpstreamConfig {
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_read_timeout_ms")]
+    pub read_timeout_ms: u64,
 }
 
 #[derive(Debug)]
@@ -91,6 +101,7 @@ impl Config {
         }
 
         self.health_check.validate()?;
+        self.upstream.validate()?;
 
         Ok(())
     }
@@ -185,6 +196,41 @@ impl HealthCheckConfig {
 
         Ok(())
     }
+}
+
+impl UpstreamConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.connect_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "upstream.connect_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.read_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "upstream.read_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_ms: default_connect_timeout_ms(),
+            read_timeout_ms: default_read_timeout_ms(),
+        }
+    }
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_read_timeout_ms() -> u64 {
+    15_000
 }
 
 #[cfg(test)]
@@ -297,5 +343,28 @@ health_check:
 
         let addr = config.server.socket_addr().expect("socket addr should parse");
         assert_eq!(addr.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn rejects_zero_upstream_connect_timeout() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 127.0.0.1
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+health_check:
+  interval_sec: 10
+  endpoint: /health
+upstream:
+  connect_timeout_ms: 0
+  read_timeout_ms: 1000
+"#,
+        );
+
+        assert!(config.validate().is_err());
     }
 }

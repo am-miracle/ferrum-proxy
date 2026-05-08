@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Instant;
 
-use http_body_util::Full;
+use crate::upstream::{bad_gateway_response, full_body, ProxyBody, UpstreamClient};
 use hyper::body::Bytes;
 use hyper::{Method, Request, Response, StatusCode};
 
@@ -8,26 +9,33 @@ use crate::balancing::RoundRobinBalancer;
 use crate::config::Config;
 use crate::health::{spawn_active_checks, HealthManager};
 use crate::routing::match_route;
-use crate::upstream::{bad_gateway_response, UpstreamClient};
+use crate::telemetry::Telemetry;
 
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<Config>,
     balancer: Arc<RoundRobinBalancer>,
     health: Arc<HealthManager>,
+    telemetry: Arc<Telemetry>,
     upstream: UpstreamClient,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        let upstream_config = config.upstream.clone();
+        let telemetry = Arc::new(Telemetry::new(&config.routes));
         let balancer = Arc::new(RoundRobinBalancer::new(&config.routes));
-        let health = Arc::new(HealthManager::new(&config.routes));
+        let health = Arc::new(HealthManager::with_telemetry(
+            &config.routes,
+            Some(telemetry.clone()),
+        ));
 
         Self {
             config: Arc::new(config),
             balancer,
             health,
-            upstream: UpstreamClient::new(),
+            telemetry,
+            upstream: UpstreamClient::new(&upstream_config),
         }
     }
 
@@ -36,11 +44,13 @@ impl AppState {
     }
 }
 
-pub async fn handle_request<B>(request: Request<B>, state: AppState) -> Response<Full<Bytes>>
+pub async fn handle_request<B>(request: Request<B>, state: AppState) -> Response<ProxyBody>
 where
-    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    state.telemetry.record_request();
+
     if let Some(response) = handle_internal_route(request.method(), request.uri().path(), &state) {
         return response;
     }
@@ -64,9 +74,11 @@ where
         }
     };
 
+    let started = Instant::now();
     match state.upstream.forward(backend, request).await {
         Ok(response) => {
-            if response.status().is_server_error() {
+            state.telemetry.record_upstream_latency(started.elapsed());
+            if response.status().is_server_error() { // 5xx counts as a passive failure
                 state.health.record_failure(backend);
             } else {
                 state.health.record_success(backend);
@@ -75,6 +87,7 @@ where
             response
         }
         Err(err) => {
+            state.telemetry.record_upstream_latency(started.elapsed());
             state.health.record_failure(backend);
             bad_gateway_response(&err)
         }
@@ -85,16 +98,17 @@ fn handle_internal_route(
     method: &Method,
     path: &str,
     state: &AppState,
-) -> Option<Response<Full<Bytes>>> {
+) -> Option<Response<ProxyBody>> {
     match (method, path) {
         (&Method::GET, "/") => Some(root_response(state)),
         (&Method::GET, "/health") => Some(text_response(StatusCode::OK, "ok\n")),
         (&Method::GET, "/health/backends") => Some(backend_health_response(state)),
+        (&Method::GET, "/metrics") => Some(metrics_response(state)),
         _ => None,
     }
 }
 
-fn root_response(state: &AppState) -> Response<Full<Bytes>> {
+fn root_response(state: &AppState) -> Response<ProxyBody> {
     let route_count = state.config.routes.len();
     text_response(
         StatusCode::OK,
@@ -102,7 +116,7 @@ fn root_response(state: &AppState) -> Response<Full<Bytes>> {
     )
 }
 
-fn backend_health_response(state: &AppState) -> Response<Full<Bytes>> {
+fn backend_health_response(state: &AppState) -> Response<ProxyBody> {
     let body = state
         .health
         .backend_statuses()
@@ -115,11 +129,15 @@ fn backend_health_response(state: &AppState) -> Response<Full<Bytes>> {
     text_response(StatusCode::OK, body)
 }
 
-fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
+fn metrics_response(state: &AppState) -> Response<ProxyBody> {
+    text_response(StatusCode::OK, state.telemetry.render_report())
+}
+
+fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
-        .body(Full::new(body.into()))
-        .expect("response should be constructible")
+        .body(full_body(body))
+        .expect("invalid response")
 }
 
 #[cfg(test)]
@@ -162,6 +180,7 @@ mod tests {
                 interval_sec: 10,
                 endpoint: "/health".to_string(),
             },
+            upstream: crate::config::UpstreamConfig::default(),
         }
     }
 
@@ -200,6 +219,35 @@ mod tests {
                 b"http://127.0.0.1:3001 healthy\nhttp://127.0.0.1:3002 unhealthy\nhttp://127.0.0.1:4000 healthy\n"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_counts_and_failures() {
+        let state = sample_state();
+        state.telemetry.record_request();
+        state.telemetry
+            .record_upstream_latency(std::time::Duration::from_millis(5));
+        state.health.record_failure("http://127.0.0.1:3001");
+        state.health.record_failure("http://127.0.0.1:3001");
+        state.health.record_failure("http://127.0.0.1:3001");
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(empty_body())
+            .unwrap();
+        let response = handle_request(request, state).await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("request_count 2"));
+        assert!(text.contains("upstream_latency_count 1"));
+        assert!(text.contains("backend_failure backend=http://127.0.0.1:3001 count=3"));
+        assert!(text.contains(
+            "health_transition backend=http://127.0.0.1:3001 from=healthy to=unhealthy reason=failure_threshold"
+        ));
     }
 
     #[tokio::test]
@@ -673,6 +721,7 @@ mod tests {
                 interval_sec: 10,
                 endpoint: "/health".to_string(),
             },
+            upstream: crate::config::UpstreamConfig::default(),
         })
     }
 
@@ -696,6 +745,7 @@ mod tests {
                 interval_sec: 10,
                 endpoint: "/health".to_string(),
             },
+            upstream: crate::config::UpstreamConfig::default(),
         })
     }
 

@@ -4,7 +4,7 @@ pub fn match_route<'a>(path: &str, routes: &'a [RouteConfig]) -> Option<&'a Rout
     routes
         .iter()
         .filter(|route| path.starts_with(&route.path_prefix))
-        .max_by_key(|route| route.path_prefix.len())
+        .max_by_key(|route| route.path_prefix.len()) // longest prefix wins
 }
 
 #[cfg(test)]

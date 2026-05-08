@@ -1,12 +1,5 @@
-mod balancing;
-mod config;
-mod health;
-mod http;
-mod routing;
-mod server;
-mod upstream;
-
-use config::Config;
+use ferrum_proxy::config::Config;
+use ferrum_proxy::server;
 
 #[tokio::main]
 async fn main() {

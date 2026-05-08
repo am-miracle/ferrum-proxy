@@ -26,7 +26,7 @@ impl RoundRobinBalancer {
             .counters
             .get(route_key)
             .map(|counter| counter.fetch_add(1, Ordering::Relaxed) % backends.len())
-            .unwrap_or(0);
+            .unwrap_or(0); // unknown prefix, fall back to first backend
 
         backends.get(index).copied()
     }
