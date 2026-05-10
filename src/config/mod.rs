@@ -31,6 +31,12 @@ pub struct RouteConfig {
 pub struct HealthCheckConfig {
     pub interval_sec: u64,
     pub endpoint: String,
+    #[serde(default = "default_check_timeout_ms")]
+    pub check_timeout_ms: u64,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: usize,
+    #[serde(default = "default_recovery_threshold")]
+    pub recovery_threshold: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -194,7 +200,37 @@ impl HealthCheckConfig {
             ));
         }
 
+        if self.check_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "health_check.check_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.failure_threshold == 0 {
+            return Err(ConfigError::Validation(
+                "health_check.failure_threshold must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.recovery_threshold == 0 {
+            return Err(ConfigError::Validation(
+                "health_check.recovery_threshold must be greater than 0".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_sec: 10,
+            endpoint: "/health".to_string(),
+            check_timeout_ms: default_check_timeout_ms(),
+            failure_threshold: default_failure_threshold(),
+            recovery_threshold: default_recovery_threshold(),
+        }
     }
 }
 
@@ -231,6 +267,18 @@ fn default_connect_timeout_ms() -> u64 {
 
 fn default_read_timeout_ms() -> u64 {
     15_000
+}
+
+fn default_check_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_failure_threshold() -> usize {
+    3
+}
+
+fn default_recovery_threshold() -> usize {
+    2
 }
 
 #[cfg(test)]

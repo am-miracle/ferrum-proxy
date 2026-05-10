@@ -16,12 +16,11 @@ use url::Url;
 use crate::config::{Config, RouteConfig};
 use crate::telemetry::Telemetry;
 
-const FAILURE_THRESHOLD: usize = 3;
-const RECOVERY_THRESHOLD: usize = 2;
-
 pub struct HealthManager {
     backend_health: HashMap<String, BackendHealth>,
     telemetry: Option<Arc<Telemetry>>,
+    failure_threshold: usize,
+    recovery_threshold: usize,
 }
 
 struct BackendHealth {
@@ -33,10 +32,15 @@ struct BackendHealth {
 impl HealthManager {
     #[cfg(test)]
     pub fn new(routes: &[RouteConfig]) -> Self {
-        Self::with_telemetry(routes, None)
+        Self::with_telemetry(routes, 3, 2, None)
     }
 
-    pub fn with_telemetry(routes: &[RouteConfig], telemetry: Option<Arc<Telemetry>>) -> Self {
+    pub fn with_telemetry(
+        routes: &[RouteConfig],
+        failure_threshold: usize,
+        recovery_threshold: usize,
+        telemetry: Option<Arc<Telemetry>>,
+    ) -> Self {
         let mut backend_health = HashMap::new();
 
         for route in routes {
@@ -50,6 +54,8 @@ impl HealthManager {
         Self {
             backend_health,
             telemetry,
+            failure_threshold,
+            recovery_threshold,
         }
     }
 
@@ -90,7 +96,7 @@ impl HealthManager {
             state.consecutive_failures.store(0, Ordering::Relaxed); // any success resets the failure streak
             let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
 
-            if !state.healthy.load(Ordering::Relaxed) && successes >= RECOVERY_THRESHOLD {
+            if !state.healthy.load(Ordering::Relaxed) && successes >= self.recovery_threshold {
                 state.healthy.store(true, Ordering::Relaxed);
                 state.consecutive_successes.store(0, Ordering::Relaxed);
                 self.record_transition(backend, "unhealthy", "healthy", "success_threshold");
@@ -106,7 +112,7 @@ impl HealthManager {
             }
             let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
-            if state.healthy.load(Ordering::Relaxed) && failures >= FAILURE_THRESHOLD {
+            if state.healthy.load(Ordering::Relaxed) && failures >= self.failure_threshold {
                 state.healthy.store(false, Ordering::Relaxed);
                 state.consecutive_failures.store(0, Ordering::Relaxed);
                 self.record_transition(backend, "healthy", "unhealthy", "failure_threshold");
@@ -139,29 +145,32 @@ impl BackendHealth {
 
 pub fn spawn_active_checks(config: Arc<Config>, manager: Arc<HealthManager>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let check_timeout = Duration::from_millis(config.health_check.check_timeout_ms);
         let client = health_client();
         let mut interval = time::interval(Duration::from_secs(config.health_check.interval_sec));
 
         loop {
             interval.tick().await;
-            run_active_check_pass_with_client(&client, &config, &manager).await;
+            run_active_check_pass_with_client(&client, &config, &manager, check_timeout).await;
         }
     })
 }
 
 #[cfg(test)]
 pub async fn run_active_check_pass(config: &Config, manager: &HealthManager) {
+    let check_timeout = Duration::from_millis(config.health_check.check_timeout_ms);
     let client = health_client();
-    run_active_check_pass_with_client(&client, config, manager).await;
+    run_active_check_pass_with_client(&client, config, manager, check_timeout).await;
 }
 
 async fn run_active_check_pass_with_client(
     client: &Client<HttpConnector, Empty<Bytes>>,
     config: &Config,
     manager: &HealthManager,
+    check_timeout: Duration,
 ) {
     for backend in unique_backends(&config.routes) {
-        if probe_backend(client, backend.as_str(), &config.health_check.endpoint)
+        if check_backend(client, backend.as_str(), &config.health_check.endpoint, check_timeout)
             .await
             .is_success()
         {
@@ -172,10 +181,11 @@ async fn run_active_check_pass_with_client(
     }
 }
 
-async fn probe_backend(
+async fn check_backend(
     client: &Client<HttpConnector, Empty<Bytes>>,
     backend: &str,
     endpoint: &str,
+    check_timeout: Duration,
 ) -> StatusCode {
     let uri = match build_healthcheck_uri(backend, endpoint) {
         Ok(uri) => uri,
@@ -187,9 +197,9 @@ async fn probe_backend(
         Err(_) => return StatusCode::BAD_GATEWAY,
     };
 
-    match client.request(request).await {
-        Ok(response) => response.status(),
-        Err(_) => StatusCode::BAD_GATEWAY, // unreachable = unhealthy
+    match time::timeout(check_timeout, client.request(request)).await {
+        Ok(Ok(response)) => response.status(),
+        _ => StatusCode::BAD_GATEWAY, // timeout or connection error = unhealthy
     }
 }
 
@@ -208,7 +218,7 @@ fn build_healthcheck_uri(backend: &str, endpoint: &str) -> Result<Uri, url::Pars
         .expect("invalid health check URI"))
 }
 
-// a backend may appear in multiple routes; probe it once per cycle
+// a backend may appear in multiple routes; check it once per cycle
 fn unique_backends(routes: &[RouteConfig]) -> Vec<String> {
     let mut backends = HashSet::new();
 
@@ -327,7 +337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_checks_mark_backend_unhealthy_after_failed_probes() {
+    async fn active_checks_mark_backend_unhealthy_after_failed_checks() {
         let backend = "http://127.0.0.1:9";
         let config = config_with_backends(vec![backend.to_string()]);
         let manager = HealthManager::new(&config.routes);
@@ -382,6 +392,7 @@ mod tests {
             health_check: HealthCheckConfig {
                 interval_sec: 1,
                 endpoint: "/health".to_string(),
+                ..Default::default()
             },
             upstream: crate::config::UpstreamConfig::default(),
         }

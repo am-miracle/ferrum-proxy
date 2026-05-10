@@ -99,6 +99,7 @@ impl UpstreamClient {
 
         let (parts, body): (_, Incoming) = upstream_response.into_parts();
         let read_timeout = self.read_timeout;
+        // per-chunk idle timeout: fires if no data arrives within read_timeout
         let stream = body
             .into_data_stream()
             .timeout(read_timeout)
@@ -154,7 +155,7 @@ fn build_upstream_uri(backend: &str, request_uri: &Uri) -> Result<Uri, UpstreamE
 fn timeout_error(duration: Duration) -> ProxyError {
     Box::new(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!("upstream read timeout after {} ms", duration.as_millis()),
+        format!("upstream idle timeout: no data received for {} ms", duration.as_millis()),
     ))
 }
 
@@ -217,7 +218,7 @@ mod tests {
         let err = response.into_body().collect().await.unwrap_err();
         let err_text = err.to_string();
 
-        assert!(err_text.contains("upstream read timeout"));
+        assert!(err_text.contains("upstream idle timeout"));
     }
 
     async fn spawn_header_stall_server() -> String {

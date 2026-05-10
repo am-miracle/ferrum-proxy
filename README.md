@@ -1,8 +1,6 @@
 # ferrum-proxy
 
-`ferrum-proxy` is a Rust HTTP reverse proxy.
-
-It sits in front of your backend services, matches a request to a route, picks a healthy backend, forwards the request, and sends the response back to the client.
+`ferrum-proxy` is a Rust HTTP reverse proxy. It sits in front of your backend services, matches a request to a route, picks a healthy backend, forwards the request, and sends the response back to the client.
 
 ## What it does
 

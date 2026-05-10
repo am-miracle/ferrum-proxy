@@ -17,6 +17,7 @@ fn config(routes: Vec<RouteConfig>) -> Config {
         health_check: HealthCheckConfig {
             interval_sec: 10,
             endpoint: "/health".to_string(),
+            ..Default::default()
         },
         upstream: UpstreamConfig::default(),
     }

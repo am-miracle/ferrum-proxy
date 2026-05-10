@@ -27,6 +27,8 @@ impl AppState {
         let balancer = Arc::new(RoundRobinBalancer::new(&config.routes));
         let health = Arc::new(HealthManager::with_telemetry(
             &config.routes,
+            config.health_check.failure_threshold,
+            config.health_check.recovery_threshold,
             Some(telemetry.clone()),
         ));
 
@@ -40,7 +42,12 @@ impl AppState {
     }
 
     pub fn spawn_background_tasks(&self) {
-        spawn_active_checks(self.config.clone(), self.health.clone());
+        let handle = spawn_active_checks(self.config.clone(), self.health.clone());
+        tokio::spawn(async move {
+            if let Err(panic) = handle.await {
+                eprintln!("health check task panicked: {panic}");
+            }
+        });
     }
 }
 
@@ -179,6 +186,7 @@ mod tests {
             health_check: HealthCheckConfig {
                 interval_sec: 10,
                 endpoint: "/health".to_string(),
+                ..Default::default()
             },
             upstream: crate::config::UpstreamConfig::default(),
         }
@@ -720,6 +728,7 @@ mod tests {
             health_check: HealthCheckConfig {
                 interval_sec: 10,
                 endpoint: "/health".to_string(),
+                ..Default::default()
             },
             upstream: crate::config::UpstreamConfig::default(),
         })
@@ -744,6 +753,7 @@ mod tests {
             health_check: HealthCheckConfig {
                 interval_sec: 10,
                 endpoint: "/health".to_string(),
+                ..Default::default()
             },
             upstream: crate::config::UpstreamConfig::default(),
         })
