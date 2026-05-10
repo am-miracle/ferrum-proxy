@@ -12,6 +12,7 @@ fn config(routes: Vec<RouteConfig>) -> Config {
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 8080,
+            ..Default::default()
         },
         routes,
         health_check: HealthCheckConfig {

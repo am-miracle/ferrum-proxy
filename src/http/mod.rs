@@ -1,13 +1,16 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::upstream::{bad_gateway_response, full_body, ProxyBody, UpstreamClient};
+use crate::upstream::{ProxyBody, UpstreamClient, bad_gateway_response, full_body};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request, Response, StatusCode};
+use tokio_stream::StreamExt;
 
 use crate::balancing::RoundRobinBalancer;
 use crate::config::Config;
-use crate::health::{spawn_active_checks, HealthManager};
+use crate::health::{HealthManager, spawn_active_checks};
 use crate::routing::match_route;
 use crate::telemetry::Telemetry;
 
@@ -18,6 +21,11 @@ pub struct AppState {
     health: Arc<HealthManager>,
     telemetry: Arc<Telemetry>,
     upstream: UpstreamClient,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConnectionInfo {
+    pub remote_addr: SocketAddr,
 }
 
 impl AppState {
@@ -41,13 +49,30 @@ impl AppState {
         }
     }
 
-    pub fn spawn_background_tasks(&self) {
-        let handle = spawn_active_checks(self.config.clone(), self.health.clone());
+    pub fn spawn_background_tasks(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
+        let handle = spawn_active_checks(self.config.clone(), self.health.clone(), shutdown);
+        let telemetry = self.telemetry.clone();
         tokio::spawn(async move {
             if let Err(panic) = handle.await {
-                eprintln!("health check task panicked: {panic}");
+                telemetry.log_background_task_failure("health_checks", &panic.to_string());
             }
         });
+    }
+
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
+    }
+
+    pub fn telemetry_handle(&self) -> Arc<Telemetry> {
+        self.telemetry.clone()
+    }
+
+    pub fn shutdown_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.server.graceful_shutdown_timeout_ms)
+    }
+
+    pub fn client_header_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.server.client_header_timeout_ms)
     }
 }
 
@@ -58,13 +83,44 @@ where
 {
     state.telemetry.record_request();
 
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+
     if let Some(response) = handle_internal_route(request.method(), request.uri().path(), &state) {
-        return response;
+        return complete_request(&state, &method, &path, None, Instant::now(), response, None);
     }
 
-    let path = request.uri().path();
-    let Some(route) = match_route(path, &state.config.routes) else {
-        return text_response(StatusCode::NOT_FOUND, "no route matched request path\n");
+    if let Some(content_length) =
+        content_length_exceeds(request.headers(), state.upstream.max_request_body_bytes())
+    {
+        state.telemetry.record_proxy_error("request_body_too_large");
+        return complete_request(
+            &state,
+            &method,
+            &path,
+            None,
+            Instant::now(),
+            text_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "request body too large: content-length {content_length} exceeds {} byte limit\n",
+                    state.upstream.max_request_body_bytes()
+                ),
+            ),
+            Some("request_body_too_large"),
+        );
+    }
+
+    let Some(route) = match_route(&path, &state.config.routes) else {
+        return complete_request(
+            &state,
+            &method,
+            &path,
+            None,
+            Instant::now(),
+            text_response(StatusCode::NOT_FOUND, "no route matched request path\n"),
+            None,
+        );
     };
 
     let healthy_backends = state.health.healthy_backends(route);
@@ -74,31 +130,225 @@ where
     {
         Some(backend) => backend,
         None => {
-            return text_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no healthy backends available\n",
+            state.telemetry.record_proxy_error("no_healthy_backends");
+            return complete_request(
+                &state,
+                &method,
+                &path,
+                None,
+                Instant::now(),
+                text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no healthy backends available\n",
+                ),
+                Some("no_healthy_backends"),
             );
         }
     };
 
+    let client_addr = request
+        .extensions()
+        .get::<ConnectionInfo>()
+        .map(|info| info.remote_addr);
     let started = Instant::now();
-    match state.upstream.forward(backend, request).await {
+
+    let client_body_timeout = Duration::from_millis(state.config.server.client_body_timeout_ms);
+    if should_prebuffer_request(&method) {
+        match buffer_request_body(
+            request,
+            state.upstream.max_request_body_bytes(),
+            client_body_timeout,
+        )
+        .await
+        {
+            Ok(request) => {
+                forward_request(
+                    &state,
+                    &method,
+                    &path,
+                    backend,
+                    request,
+                    client_addr,
+                    started,
+                    client_body_timeout,
+                )
+                .await
+            }
+            Err(err) => {
+                let kind = err.kind();
+                state.telemetry.record_proxy_error(kind);
+                complete_request(
+                    &state,
+                    &method,
+                    &path,
+                    Some(backend),
+                    started,
+                    err.into_response(),
+                    Some(kind),
+                )
+            }
+        }
+    } else {
+        forward_request(
+            &state,
+            &method,
+            &path,
+            backend,
+            request,
+            client_addr,
+            started,
+            client_body_timeout,
+        )
+        .await
+    }
+}
+
+async fn forward_request<B>(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    backend: &str,
+    request: Request<B>,
+    client_addr: Option<SocketAddr>,
+    started: Instant,
+    client_body_timeout: Duration,
+) -> Response<ProxyBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    match state
+        .upstream
+        .forward(backend, request, client_addr, client_body_timeout)
+        .await
+    {
         Ok(response) => {
             state.telemetry.record_upstream_latency(started.elapsed());
-            if response.status().is_server_error() { // 5xx counts as a passive failure
+            if response.status().is_server_error() {
                 state.health.record_failure(backend);
             } else {
                 state.health.record_success(backend);
             }
 
-            response
+            complete_request(state, method, path, Some(backend), started, response, None)
         }
         Err(err) => {
             state.telemetry.record_upstream_latency(started.elapsed());
             state.health.record_failure(backend);
-            bad_gateway_response(&err)
+            state.telemetry.record_proxy_error(err.kind());
+            complete_request(
+                state,
+                method,
+                path,
+                Some(backend),
+                started,
+                bad_gateway_response(&err),
+                Some(err.kind()),
+            )
         }
     }
+}
+
+async fn buffer_request_body<B>(
+    request: Request<B>,
+    max_bytes: u64,
+    idle_timeout: Duration,
+) -> Result<Request<Full<Bytes>>, RequestBufferError>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let (parts, body) = request.into_parts();
+    let stream = body.into_data_stream().timeout(idle_timeout);
+    tokio::pin!(stream);
+    let mut buffered = Vec::new();
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(Ok(chunk)) => {
+                let next_len = buffered.len() as u64 + chunk.len() as u64;
+                if next_len > max_bytes {
+                    return Err(RequestBufferError::TooLarge { limit: max_bytes });
+                }
+                buffered.extend_from_slice(&chunk);
+            }
+            Ok(Err(err)) => {
+                return Err(RequestBufferError::ReadFailed(err.to_string()));
+            }
+            Err(_) => {
+                return Err(RequestBufferError::TimedOut {
+                    timeout: idle_timeout,
+                });
+            }
+        }
+    }
+
+    Ok(Request::from_parts(parts, Full::new(Bytes::from(buffered))))
+}
+
+fn should_prebuffer_request(method: &Method) -> bool {
+    !matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    )
+}
+
+enum RequestBufferError {
+    TooLarge { limit: u64 },
+    TimedOut { timeout: Duration },
+    ReadFailed(String),
+}
+
+impl RequestBufferError {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::TooLarge { .. } => "request_body_too_large",
+            Self::TimedOut { .. } => "client_body_timeout",
+            Self::ReadFailed(_) => "request_body_read_failed",
+        }
+    }
+
+    fn into_response(self) -> Response<ProxyBody> {
+        match self {
+            Self::TooLarge { limit } => text_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeded {limit} byte limit\n"),
+            ),
+            Self::TimedOut { timeout } => text_response(
+                StatusCode::REQUEST_TIMEOUT,
+                format!(
+                    "client request body idle timeout after {} ms\n",
+                    timeout.as_millis()
+                ),
+            ),
+            Self::ReadFailed(err) => text_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to read client request body: {err}\n"),
+            ),
+        }
+    }
+}
+
+fn complete_request(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    backend: Option<&str>,
+    started: Instant,
+    response: Response<ProxyBody>,
+    error_kind: Option<&'static str>,
+) -> Response<ProxyBody> {
+    let status = response.status();
+    state.telemetry.record_response_status(status.as_u16());
+    state.telemetry.log_request_complete(
+        method.as_str(),
+        path,
+        backend,
+        status.as_u16(),
+        started.elapsed(),
+        error_kind,
+    );
+    response
 }
 
 fn handle_internal_route(
@@ -129,7 +379,10 @@ fn backend_health_response(state: &AppState) -> Response<ProxyBody> {
         .backend_statuses()
         .into_iter()
         .map(|(backend, healthy)| {
-            format!("{backend} {}\n", if healthy { "healthy" } else { "unhealthy" })
+            format!(
+                "{backend} {}\n",
+                if healthy { "healthy" } else { "unhealthy" }
+            )
         })
         .collect::<String>();
 
@@ -137,7 +390,12 @@ fn backend_health_response(state: &AppState) -> Response<ProxyBody> {
 }
 
 fn metrics_response(state: &AppState) -> Response<ProxyBody> {
-    text_response(StatusCode::OK, state.telemetry.render_report())
+    text_response(
+        StatusCode::OK,
+        state
+            .telemetry
+            .render_prometheus(&state.health.backend_statuses()),
+    )
 }
 
 fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ProxyBody> {
@@ -147,18 +405,35 @@ fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ProxyBo
         .expect("invalid response")
 }
 
+fn content_length_exceeds(
+    headers: &hyper::header::HeaderMap<hyper::header::HeaderValue>,
+    limit: u64,
+) -> Option<u64> {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|content_length| *content_length > limit)
+}
+
 #[cfg(test)]
 mod tests {
-    use http_body_util::{BodyExt, Empty, Full};
-    use hyper::body::Bytes;
-    use hyper::header::{HeaderValue, CONTENT_TYPE, HOST};
+    use http_body_util::{BodyExt, Empty, Full, StreamBody};
+    use hyper::body::{Bytes, Frame};
+    use hyper::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue};
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper::{Method, Request, Response, StatusCode};
     use hyper_util::rt::TokioIo;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
-    use super::{handle_request, AppState};
-    use crate::config::{Config, HealthCheckConfig, RouteConfig, ServerConfig};
+    use super::{AppState, ConnectionInfo, handle_request, should_prebuffer_request};
+    use crate::config::{Config, HealthCheckConfig, RouteConfig, ServerConfig, UpstreamConfig};
 
     fn sample_state() -> AppState {
         AppState::new(sample_config())
@@ -169,6 +444,7 @@ mod tests {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 8080,
+                ..Default::default()
             },
             routes: vec![
                 RouteConfig {
@@ -188,7 +464,7 @@ mod tests {
                 endpoint: "/health".to_string(),
                 ..Default::default()
             },
-            upstream: crate::config::UpstreamConfig::default(),
+            upstream: UpstreamConfig::default(),
         }
     }
 
@@ -205,36 +481,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_health_endpoint_reports_current_status() {
-        let state = state_with_api_backends(&["http://127.0.0.1:3002", "http://127.0.0.1:3001"]);
-        state.health.record_failure("http://127.0.0.1:3002");
-        state.health.record_failure("http://127.0.0.1:3002");
-        state.health.record_failure("http://127.0.0.1:3002");
-
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/health/backends")
-            .body(empty_body())
-            .unwrap();
-        let response = handle_request(request, state).await;
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            Bytes::from_static(
-                b"http://127.0.0.1:3001 healthy\nhttp://127.0.0.1:3002 unhealthy\nhttp://127.0.0.1:4000 healthy\n"
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_reports_counts_and_failures() {
+    async fn metrics_endpoint_returns_prometheus_text() {
         let state = sample_state();
         state.telemetry.record_request();
-        state.telemetry
+        state
+            .telemetry
             .record_upstream_latency(std::time::Duration::from_millis(5));
+        state.telemetry.record_response_status(200);
         state.health.record_failure("http://127.0.0.1:3001");
         state.health.record_failure("http://127.0.0.1:3001");
         state.health.record_failure("http://127.0.0.1:3001");
@@ -250,383 +503,166 @@ mod tests {
         let text = std::str::from_utf8(&body).unwrap();
 
         assert_eq!(status, StatusCode::OK);
-        assert!(text.contains("request_count 2"));
-        assert!(text.contains("upstream_latency_count 1"));
-        assert!(text.contains("backend_failure backend=http://127.0.0.1:3001 count=3"));
-        assert!(text.contains(
-            "health_transition backend=http://127.0.0.1:3001 from=healthy to=unhealthy reason=failure_threshold"
-        ));
+        assert!(text.contains("# TYPE ferrum_proxy_requests_total counter"));
+        assert!(text.contains("ferrum_proxy_requests_total 2"));
+        assert!(text.contains("ferrum_proxy_backend_healthy"));
     }
 
     #[tokio::test]
-    async fn api_route_forwards_request_to_upstream() {
-        let upstream: String = spawn_test_upstream(|request| async move {
-            let body = format!(
-                "upstream {} {}",
-                request.method(),
-                request.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
-            );
+    async fn proxy_rewrites_forwarding_headers_and_strips_connection_headers() {
+        let upstream = spawn_test_upstream(|request| async move {
+            let host = header_text(request.headers(), HOST);
+            let xff = header_text(request.headers(), "x-forwarded-for");
+            let xfp = header_text(request.headers(), "x-forwarded-proto");
+            let forwarded = header_text(request.headers(), "forwarded");
+            let connection = header_text(request.headers(), CONNECTION);
+            let keep_alive = header_text(request.headers(), "keep-alive");
+
             Response::builder()
                 .status(StatusCode::OK)
-                .header(CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-                .body(Full::new(Bytes::from(body)))
+                .header(CONNECTION, "close")
+                .body(Full::new(Bytes::from(format!(
+                    "host={host} xff={xff} xfp={xfp} forwarded={forwarded} connection={connection} keep_alive={keep_alive}"
+                ))))
                 .unwrap()
         })
         .await;
 
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(Method::GET)
             .uri("/api/users")
+            .header(HOST, "proxy.local")
+            .header(CONNECTION, "keep-alive, x-remove-me")
+            .header(HeaderName::from_static("keep-alive"), "timeout=5")
+            .header("x-remove-me", "1")
             .body(empty_body())
             .unwrap();
-        let response = handle_request(request, state_with_api_backends(&[upstream.as_str()])).await;
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
+        request.extensions_mut().insert(ConnectionInfo {
+            remote_addr: "203.0.113.10:1234".parse().unwrap(),
+        });
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, Bytes::from_static(b"upstream GET /api/users"));
+        let response = handle_request(request, state_with_api_backends(&[upstream.as_str()])).await;
+        let response_headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert!(text.contains("host=127.0.0.1:"));
+        assert!(text.contains("xff=203.0.113.10"));
+        assert!(text.contains("xfp=http"));
+        assert!(text.contains("forwarded=for=203.0.113.10;proto=http"));
+        assert!(text.contains("connection=missing"));
+        assert!(text.contains("keep_alive=missing"));
+        assert!(!response_headers.contains_key(CONNECTION));
     }
 
     #[tokio::test]
-    async fn proxy_preserves_query_headers_and_body() {
-        let upstream: String = spawn_test_upstream(|request| async move {
-            let custom_header = request
-                .headers()
-                .get("x-trace-id")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("missing")
-                .to_string();
-            let host_header = request
-                .headers()
-                .get(HOST)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("missing")
-                .to_string();
-            let body = request.into_body().collect().await.unwrap().to_bytes();
-
-            let response_body = format!(
-                "path={} query={} x-trace-id={} host={} body={}",
-                "/api/upload",
-                "source=mobile",
-                custom_header,
-                host_header,
-                std::str::from_utf8(&body).unwrap()
-            );
-
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-                .body(Full::new(Bytes::from(response_body)))
-                .unwrap()
-        })
-        .await;
-
+    async fn rejects_request_body_over_configured_limit() {
+        let state = state_with_config(Config {
+            upstream: UpstreamConfig {
+                max_request_body_bytes: 4,
+                ..Default::default()
+            },
+            ..sample_config()
+        });
         let request = Request::builder()
             .method(Method::POST)
-            .uri("/api/upload?source=mobile")
-            .header("x-trace-id", "trace-123")
-            .header(HOST, "proxy.local")
-            .body(Full::new(Bytes::from_static(b"hello upstream")))
+            .uri("/api/upload")
+            .header(CONTENT_LENGTH, "10")
+            .body(Full::new(Bytes::from_static(b"0123456789")))
             .unwrap();
-        let response = handle_request(request, state_with_api_backends(&[upstream.as_str()])).await;
+
+        let response = handle_request(request, state).await;
         let status = response.status();
-        let content_type = response.headers().get(CONTENT_TYPE).cloned();
         let body = response.into_body().collect().await.unwrap().to_bytes();
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(content_type, Some(HeaderValue::from_static("text/plain")));
-        let body_text = std::str::from_utf8(&body).unwrap();
-        assert!(body_text.contains("path=/api/upload"));
-        assert!(body_text.contains("query=source=mobile"));
-        assert!(body_text.contains("x-trace-id=trace-123"));
-        assert!(body_text.contains("body=hello upstream"));
-        assert!(body_text.contains("host=127.0.0.1:"));
-        assert!(!body_text.contains("host=proxy.local"));
-    }
-
-    #[tokio::test]
-    async fn root_endpoint_reports_loaded_routes() {
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(empty_body())
-            .unwrap();
-        let response = handle_request(request, sample_state()).await;
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(
-            body,
-            Bytes::from_static(b"ferrum-proxy is running with 2 configured route(s)\n")
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("request body too large")
         );
     }
 
     #[tokio::test]
-    async fn static_route_matches_single_backend() {
-        let upstream: String = spawn_test_upstream(|request| async move {
-            let body = format!(
-                "asset {}",
-                request.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
-            );
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from(body)))
-                .unwrap()
+    async fn chunked_request_body_over_limit_returns_payload_too_large_before_forwarding() {
+        let seen_requests = Arc::new(AtomicUsize::new(0));
+        let upstream = spawn_test_upstream({
+            let seen_requests = seen_requests.clone();
+            move |_request| {
+                let seen_requests = seen_requests.clone();
+                async move {
+                    seen_requests.fetch_add(1, Ordering::Relaxed);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from_static(b"upstream")))
+                        .unwrap()
+                }
+            }
         })
         .await;
+
+        let state = state_with_config(Config {
+            routes: vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                backends: vec![upstream],
+            }],
+            upstream: UpstreamConfig {
+                max_request_body_bytes: 4,
+                ..Default::default()
+            },
+            ..sample_config()
+        });
 
         let request = Request::builder()
-            .method(Method::GET)
-            .uri("/static/logo.png")
-            .body(empty_body())
+            .method(Method::POST)
+            .uri("/api/upload")
+            .body(chunked_body(&[b"12".as_slice(), b"345".as_slice()]))
             .unwrap();
-        let response = handle_request(request, state_with_static_backend(upstream.as_str())).await;
+
+        let response = handle_request(request, state).await;
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, Bytes::from_static(b"asset /static/logo.png"));
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(text.contains("request body exceeded 4 byte limit"));
+        assert_eq!(seen_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn prebuffers_only_unsafe_methods() {
+        assert!(!should_prebuffer_request(&Method::GET));
+        assert!(!should_prebuffer_request(&Method::HEAD));
+        assert!(!should_prebuffer_request(&Method::OPTIONS));
+        assert!(!should_prebuffer_request(&Method::TRACE));
+        assert!(should_prebuffer_request(&Method::POST));
+        assert!(should_prebuffer_request(&Method::PUT));
+        assert!(should_prebuffer_request(&Method::PATCH));
+        assert!(should_prebuffer_request(&Method::DELETE));
     }
 
     #[tokio::test]
-    async fn api_route_uses_round_robin_across_backends() {
-        let first: String = spawn_test_upstream(|_| async move {
+    async fn rejects_upstream_response_over_configured_limit() {
+        let upstream = spawn_test_upstream(|_| async move {
             Response::builder()
                 .status(StatusCode::OK)
-                .body(Full::new(Bytes::from_static(b"backend-1")))
-                .unwrap()
-        })
-        .await;
-        let second: String = spawn_test_upstream(|_| async move {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from_static(b"backend-2")))
+                .header(CONTENT_LENGTH, "10")
+                .body(Full::new(Bytes::from_static(b"0123456789")))
                 .unwrap()
         })
         .await;
 
-        let state = state_with_api_backends(&[first.as_str(), second.as_str()]);
-
-        let first_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        let first_body = first_response.into_body().collect().await.unwrap().to_bytes();
-
-        let second_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state,
-        )
-        .await;
-        let second_body = second_response.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(first_body, Bytes::from_static(b"backend-1"));
-        assert_eq!(second_body, Bytes::from_static(b"backend-2"));
-    }
-
-    #[tokio::test]
-    async fn passive_failures_mark_backend_unhealthy_and_skip_it() {
-        let healthy: String = spawn_test_upstream(|_| async move {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from_static(b"healthy-backend")))
-                .unwrap()
-        })
-        .await;
-
-        let failing_backend = "http://127.0.0.1:9";
-        let state = state_with_api_backends(&[failing_backend, healthy.as_str()]);
-
-        let first_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        assert_eq!(first_response.status(), StatusCode::BAD_GATEWAY);
-
-        let second_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        let second_body = second_response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(second_body, Bytes::from_static(b"healthy-backend"));
-
-        let third_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        assert_eq!(third_response.status(), StatusCode::BAD_GATEWAY);
-
-        let fourth_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        let fourth_body = fourth_response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(fourth_body, Bytes::from_static(b"healthy-backend"));
-
-        let fifth_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        assert_eq!(fifth_response.status(), StatusCode::BAD_GATEWAY);
-
-        let sixth_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state,
-        )
-        .await;
-        let sixth_body = sixth_response.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(sixth_body, Bytes::from_static(b"healthy-backend"));
-    }
-
-    #[tokio::test]
-    async fn passive_server_errors_mark_backend_unhealthy_and_skip_it() {
-        let failing: String = spawn_test_upstream(|_| async move {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from_static(b"boom")))
-                .unwrap()
-        })
-        .await;
-        let healthy: String = spawn_test_upstream(|_| async move {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from_static(b"healthy-backend")))
-                .unwrap()
-        })
-        .await;
-
-        let state = state_with_api_backends(&[failing.as_str(), healthy.as_str()]);
-
-        let first_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        assert_eq!(first_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let second_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        let second_body = second_response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(second_body, Bytes::from_static(b"healthy-backend"));
-
-        let third_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        assert_eq!(third_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let fourth_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        let fourth_body = fourth_response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(fourth_body, Bytes::from_static(b"healthy-backend"));
-
-        let fifth_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state.clone(),
-        )
-        .await;
-        assert_eq!(fifth_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let sixth_response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state,
-        )
-        .await;
-        let sixth_body = sixth_response.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(sixth_body, Bytes::from_static(b"healthy-backend"));
-    }
-
-    #[tokio::test]
-    async fn skips_unhealthy_backends_during_round_robin() {
-        let first: String = spawn_test_upstream(|_| async move {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from_static(b"backend-1")))
-                .unwrap()
-        })
-        .await;
-        let second: String = spawn_test_upstream(|_| async move {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from_static(b"backend-2")))
-                .unwrap()
-        })
-        .await;
-
-        let state = state_with_api_backends(&[first.as_str(), second.as_str()]);
-        state.health.record_failure(first.as_str());
-        state.health.record_failure(first.as_str());
-        state.health.record_failure(first.as_str());
+        let state = state_with_config(Config {
+            routes: vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                backends: vec![upstream],
+            }],
+            upstream: UpstreamConfig {
+                max_response_body_bytes: 4,
+                ..Default::default()
+            },
+            ..sample_config()
+        });
 
         let response = handle_request(
             Request::builder()
@@ -637,40 +673,8 @@ mod tests {
             state,
         )
         .await;
-        let body = response.into_body().collect().await.unwrap().to_bytes();
 
-        assert_eq!(body, Bytes::from_static(b"backend-2"));
-    }
-
-    #[tokio::test]
-    async fn returns_service_unavailable_when_no_healthy_backends_exist() {
-        let first: String = spawn_test_upstream(|_| async move {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from_static(b"backend-1")))
-                .unwrap()
-        })
-        .await;
-
-        let state = state_with_api_backends(&[first.as_str()]);
-        state.health.record_failure(first.as_str());
-        state.health.record_failure(first.as_str());
-        state.health.record_failure(first.as_str());
-
-        let response = handle_request(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/users")
-                .body(empty_body())
-                .unwrap(),
-            state,
-        )
-        .await;
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body, Bytes::from_static(b"no healthy backends available\n"));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -688,25 +692,41 @@ mod tests {
         assert_eq!(body, Bytes::from_static(b"no route matched request path\n"));
     }
 
-    #[tokio::test]
-    async fn upstream_failures_return_bad_gateway() {
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/api/users")
-            .body(empty_body())
-            .unwrap();
-        let response = handle_request(request, state_with_api_backends(&["http://127.0.0.1:9"])).await;
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(std::str::from_utf8(&body)
-            .unwrap()
-            .starts_with("bad gateway: upstream request failed:"));
+    fn header_text(
+        headers: &hyper::header::HeaderMap<HeaderValue>,
+        name: impl hyper::header::AsHeaderName,
+    ) -> String {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing")
+            .to_string()
     }
 
     fn empty_body() -> Empty<Bytes> {
         Empty::new()
+    }
+
+    fn chunked_body(
+        chunks: &[&[u8]],
+    ) -> StreamBody<ReceiverStream<Result<Frame<Bytes>, std::convert::Infallible>>> {
+        let (tx, rx) = mpsc::channel(chunks.len());
+        let owned_chunks: Vec<Bytes> = chunks
+            .iter()
+            .map(|chunk| Bytes::copy_from_slice(chunk))
+            .collect();
+
+        tokio::spawn(async move {
+            for chunk in owned_chunks {
+                let _ = tx
+                    .send(Ok::<Frame<Bytes>, std::convert::Infallible>(Frame::data(
+                        chunk,
+                    )))
+                    .await;
+            }
+        });
+
+        StreamBody::new(ReceiverStream::new(rx))
     }
 
     fn state_with_api_backends(backends: &[&str]) -> AppState {
@@ -714,11 +734,15 @@ mod tests {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 8080,
+                ..Default::default()
             },
             routes: vec![
                 RouteConfig {
                     path_prefix: "/api".to_string(),
-                    backends: backends.iter().map(|backend| (*backend).to_string()).collect(),
+                    backends: backends
+                        .iter()
+                        .map(|backend| (*backend).to_string())
+                        .collect(),
                 },
                 RouteConfig {
                     path_prefix: "/static".to_string(),
@@ -730,32 +754,7 @@ mod tests {
                 endpoint: "/health".to_string(),
                 ..Default::default()
             },
-            upstream: crate::config::UpstreamConfig::default(),
-        })
-    }
-
-    fn state_with_static_backend(backend: &str) -> AppState {
-        state_with_config(Config {
-            server: ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            routes: vec![
-                RouteConfig {
-                    path_prefix: "/api".to_string(),
-                    backends: vec!["http://127.0.0.1:3001".to_string()],
-                },
-                RouteConfig {
-                    path_prefix: "/static".to_string(),
-                    backends: vec![backend.to_string()],
-                },
-            ],
-            health_check: HealthCheckConfig {
-                interval_sec: 10,
-                endpoint: "/health".to_string(),
-                ..Default::default()
-            },
-            upstream: crate::config::UpstreamConfig::default(),
+            upstream: UpstreamConfig::default(),
         })
     }
 

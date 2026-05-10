@@ -19,6 +19,12 @@ pub struct Config {
 pub struct ServerConfig {
     pub port: u16,
     pub host: String,
+    #[serde(default = "default_graceful_shutdown_timeout_ms")]
+    pub graceful_shutdown_timeout_ms: u64,
+    #[serde(default = "default_client_header_timeout_ms")]
+    pub client_header_timeout_ms: u64,
+    #[serde(default = "default_client_body_timeout_ms")]
+    pub client_body_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -45,6 +51,10 @@ pub struct UpstreamConfig {
     pub connect_timeout_ms: u64,
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: u64,
+    #[serde(default = "default_max_response_body_bytes")]
+    pub max_response_body_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -124,6 +134,24 @@ impl ServerConfig {
         if self.host.trim().is_empty() {
             return Err(ConfigError::Validation(
                 "server.host must not be empty".to_string(),
+            ));
+        }
+
+        if self.graceful_shutdown_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "server.graceful_shutdown_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.client_header_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "server.client_header_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.client_body_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "server.client_body_timeout_ms must be greater than 0".to_string(),
             ));
         }
 
@@ -234,6 +262,18 @@ impl Default for HealthCheckConfig {
     }
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: 8080,
+            host: "127.0.0.1".to_string(),
+            graceful_shutdown_timeout_ms: default_graceful_shutdown_timeout_ms(),
+            client_header_timeout_ms: default_client_header_timeout_ms(),
+            client_body_timeout_ms: default_client_body_timeout_ms(),
+        }
+    }
+}
+
 impl UpstreamConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.connect_timeout_ms == 0 {
@@ -248,6 +288,18 @@ impl UpstreamConfig {
             ));
         }
 
+        if self.max_request_body_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "upstream.max_request_body_bytes must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.max_response_body_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "upstream.max_response_body_bytes must be greater than 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -257,6 +309,8 @@ impl Default for UpstreamConfig {
         Self {
             connect_timeout_ms: default_connect_timeout_ms(),
             read_timeout_ms: default_read_timeout_ms(),
+            max_request_body_bytes: default_max_request_body_bytes(),
+            max_response_body_bytes: default_max_response_body_bytes(),
         }
     }
 }
@@ -267,6 +321,26 @@ fn default_connect_timeout_ms() -> u64 {
 
 fn default_read_timeout_ms() -> u64 {
     15_000
+}
+
+fn default_graceful_shutdown_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_client_header_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_client_body_timeout_ms() -> u64 {
+    15_000
+}
+
+fn default_max_request_body_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_max_response_body_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_check_timeout_ms() -> u64 {
@@ -389,7 +463,10 @@ health_check:
 "#,
         );
 
-        let addr = config.server.socket_addr().expect("socket addr should parse");
+        let addr = config
+            .server
+            .socket_addr()
+            .expect("socket addr should parse");
         assert_eq!(addr.to_string(), "127.0.0.1:8080");
     }
 
@@ -410,6 +487,50 @@ health_check:
 upstream:
   connect_timeout_ms: 0
   read_timeout_ms: 1000
+"#,
+        );
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_graceful_shutdown_timeout() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 127.0.0.1
+  graceful_shutdown_timeout_ms: 0
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+health_check:
+  interval_sec: 10
+  endpoint: /health
+"#,
+        );
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_upstream_body_limits() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 127.0.0.1
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+health_check:
+  interval_sec: 10
+  endpoint: /health
+upstream:
+  max_request_body_bytes: 0
+  max_response_body_bytes: 1
 "#,
         );
 

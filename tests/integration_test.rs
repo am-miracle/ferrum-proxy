@@ -12,6 +12,7 @@ use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -88,20 +89,77 @@ async fn reports_backend_health_and_metrics_after_passive_failures() {
     let metrics = get(&server.base_url, "/metrics").await;
 
     assert_eq!(backend_health.status, StatusCode::OK);
-    assert!(backend_health.body.contains(&format!("{failing} unhealthy")));
+    assert!(
+        backend_health
+            .body
+            .contains(&format!("{failing} unhealthy"))
+    );
     assert!(backend_health.body.contains(&format!("{healthy} healthy")));
 
     assert_eq!(metrics.status, StatusCode::OK);
-    assert!(metric_value(&metrics.body, "request_count") >= 8);
-    assert_eq!(metric_value(&metrics.body, "upstream_latency_count"), 6);
-    assert!(metrics
-        .body
-        .contains(&format!("backend_failure backend={failing} count=")));
+    assert!(metric_value(&metrics.body, "ferrum_proxy_requests_total") >= 8);
+    assert_eq!(
+        metric_value(
+            &metrics.body,
+            "ferrum_proxy_upstream_request_duration_microseconds_count"
+        ),
+        6
+    );
     assert!(metrics.body.contains(&format!(
-        "health_transition backend={failing} from=healthy to=unhealthy reason=failure_threshold"
+        "ferrum_proxy_backend_failures_total{{backend=\"{failing}\"}}"
     )));
+    assert!(
+        metrics
+            .body
+            .contains("ferrum_proxy_health_transitions_total")
+    );
 
     server.shutdown();
+}
+
+#[tokio::test]
+async fn drains_in_flight_request_during_graceful_shutdown() {
+    let backend = spawn_slow_upstream(
+        "drained-backend",
+        StatusCode::OK,
+        Duration::from_millis(100),
+    )
+    .await;
+    let config = config(
+        pick_unused_port(),
+        vec![route("/api", std::slice::from_ref(&backend))],
+    );
+    let base_url = format!("http://{}:{}", config.server.host, config.server.port);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let task = tokio::spawn(async move {
+        let _ = server::run_with_shutdown(config, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+    });
+
+    wait_until_ready(&base_url).await;
+
+    let request_task = tokio::spawn({
+        let base_url = base_url.clone();
+        async move { get(&base_url, "/api/users").await }
+    });
+
+    sleep(Duration::from_millis(20)).await;
+    let _ = shutdown_tx.send(());
+
+    let response = timeout(Duration::from_secs(1), request_task)
+        .await
+        .expect("request should finish before drain timeout")
+        .expect("request task should not panic");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, "drained-backend");
+
+    timeout(Duration::from_secs(1), task)
+        .await
+        .expect("server should shut down after draining")
+        .expect("server task should not panic");
 }
 
 struct TestServer {
@@ -163,12 +221,7 @@ async fn try_get(base_url: &str, path: &str) -> Option<TestResponse> {
         .ok()?
         .ok()?;
     let status = response.status();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .ok()?
-        .to_bytes();
+    let body = response.into_body().collect().await.ok()?.to_bytes();
 
     Some(TestResponse {
         status,
@@ -186,6 +239,7 @@ fn config(port: u16, routes: Vec<RouteConfig>) -> Config {
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port,
+            ..Default::default()
         },
         routes,
         health_check: HealthCheckConfig {
@@ -212,6 +266,14 @@ fn pick_unused_port() -> u16 {
 }
 
 async fn spawn_upstream(payload: &'static str, status: StatusCode) -> String {
+    spawn_slow_upstream(payload, status, Duration::from_millis(0)).await
+}
+
+async fn spawn_slow_upstream(
+    payload: &'static str,
+    status: StatusCode,
+    response_delay: Duration,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -222,6 +284,9 @@ async fn spawn_upstream(payload: &'static str, status: StatusCode) -> String {
 
             tokio::spawn(async move {
                 let service = service_fn(move |_request: Request<Incoming>| async move {
+                    if !response_delay.is_zero() {
+                        sleep(response_delay).await;
+                    }
                     Ok::<_, Infallible>(
                         Response::builder()
                             .status(status)

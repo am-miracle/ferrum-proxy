@@ -9,6 +9,7 @@ use hyper::{Request, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time;
 use url::Url;
@@ -79,12 +80,7 @@ impl HealthManager {
         let mut statuses: Vec<_> = self
             .backend_health
             .iter()
-            .map(|(backend, state)| {
-                (
-                    backend.clone(),
-                    state.healthy.load(Ordering::Relaxed),
-                )
-            })
+            .map(|(backend, state)| (backend.clone(), state.healthy.load(Ordering::Relaxed)))
             .collect();
 
         statuses.sort_by(|left, right| left.0.cmp(&right.0));
@@ -143,15 +139,27 @@ impl BackendHealth {
     }
 }
 
-pub fn spawn_active_checks(config: Arc<Config>, manager: Arc<HealthManager>) -> JoinHandle<()> {
+pub fn spawn_active_checks(
+    config: Arc<Config>,
+    manager: Arc<HealthManager>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let check_timeout = Duration::from_millis(config.health_check.check_timeout_ms);
         let client = health_client();
         let mut interval = time::interval(Duration::from_secs(config.health_check.interval_sec));
 
         loop {
-            interval.tick().await;
-            run_active_check_pass_with_client(&client, &config, &manager, check_timeout).await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    run_active_check_pass_with_client(&client, &config, &manager, check_timeout).await;
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
         }
     })
 }
@@ -170,9 +178,14 @@ async fn run_active_check_pass_with_client(
     check_timeout: Duration,
 ) {
     for backend in unique_backends(&config.routes) {
-        if check_backend(client, backend.as_str(), &config.health_check.endpoint, check_timeout)
-            .await
-            .is_success()
+        if check_backend(
+            client,
+            backend.as_str(),
+            &config.health_check.endpoint,
+            check_timeout,
+        )
+        .await
+        .is_success()
         {
             manager.record_success(backend.as_str());
         } else {
@@ -212,10 +225,7 @@ fn build_healthcheck_uri(backend: &str, endpoint: &str) -> Result<Uri, url::Pars
     let mut url = Url::parse(backend)?;
     url.set_path(endpoint);
     url.set_query(None);
-    Ok(url
-        .as_str()
-        .parse()
-        .expect("invalid health check URI"))
+    Ok(url.as_str().parse().expect("invalid health check URI"))
 }
 
 // a backend may appear in multiple routes; check it once per cycle
@@ -384,6 +394,7 @@ mod tests {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 8080,
+                ..Default::default()
             },
             routes: vec![RouteConfig {
                 path_prefix: "/api".to_string(),

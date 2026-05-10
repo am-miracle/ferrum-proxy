@@ -48,13 +48,29 @@ mod tests {
                 "http://127.0.0.1:3003".to_string(),
             ],
         };
-        let backends = ["http://127.0.0.1:3001", "http://127.0.0.1:3002", "http://127.0.0.1:3003"];
+        let backends = [
+            "http://127.0.0.1:3001",
+            "http://127.0.0.1:3002",
+            "http://127.0.0.1:3003",
+        ];
         let balancer = RoundRobinBalancer::new(&[route]);
 
-        assert_eq!(balancer.select_backend("/api", &backends), Some("http://127.0.0.1:3001"));
-        assert_eq!(balancer.select_backend("/api", &backends), Some("http://127.0.0.1:3002"));
-        assert_eq!(balancer.select_backend("/api", &backends), Some("http://127.0.0.1:3003"));
-        assert_eq!(balancer.select_backend("/api", &backends), Some("http://127.0.0.1:3001"));
+        assert_eq!(
+            balancer.select_backend("/api", &backends),
+            Some("http://127.0.0.1:3001")
+        );
+        assert_eq!(
+            balancer.select_backend("/api", &backends),
+            Some("http://127.0.0.1:3002")
+        );
+        assert_eq!(
+            balancer.select_backend("/api", &backends),
+            Some("http://127.0.0.1:3003")
+        );
+        assert_eq!(
+            balancer.select_backend("/api", &backends),
+            Some("http://127.0.0.1:3001")
+        );
     }
 
     #[test]

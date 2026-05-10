@@ -12,6 +12,7 @@ fn config(routes: Vec<RouteConfig>) -> Config {
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 8080,
+            ..Default::default()
         },
         routes,
         health_check: HealthCheckConfig {
@@ -81,9 +82,15 @@ async fn skips_backend_after_repeated_passive_failures() {
     let sixth = request_body("/api/users", state).await;
 
     assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(second.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"healthy-backend"));
+    assert_eq!(
+        second.into_body().collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"healthy-backend")
+    );
     assert_eq!(third.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(fourth.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"healthy-backend"));
+    assert_eq!(
+        fourth.into_body().collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"healthy-backend")
+    );
     assert_eq!(fifth.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(sixth, Bytes::from_static(b"healthy-backend"));
 }
@@ -98,7 +105,10 @@ async fn request_body(path: &str, state: AppState) -> Bytes {
         .to_bytes()
 }
 
-async fn request_response(path: &str, state: AppState) -> Response<ferrum_proxy::upstream::ProxyBody> {
+async fn request_response(
+    path: &str,
+    state: AppState,
+) -> Response<ferrum_proxy::upstream::ProxyBody> {
     let request = Request::builder()
         .method(Method::GET)
         .uri(path)

@@ -9,8 +9,11 @@
 - active health checks
 - passive failure tracking from real traffic
 - request and response streaming
+- graceful shutdown and connection draining
+- hardened forwarding and hop-by-hop header handling
+- request and response size limits
 - upstream connect and read timeouts
-- simple debug endpoints for backend health and metrics
+- Prometheus-style metrics export
 
 ## Current status
 
@@ -42,6 +45,9 @@ Example:
 server:
   port: 8080
   host: 0.0.0.0
+  graceful_shutdown_timeout_ms: 30000
+  client_header_timeout_ms: 10000
+  client_body_timeout_ms: 15000
 
 routes:
   - path_prefix: /api
@@ -57,6 +63,12 @@ routes:
 health_check:
   interval_sec: 10
   endpoint: /health
+
+upstream:
+  connect_timeout_ms: 3000
+  read_timeout_ms: 15000
+  max_request_body_bytes: 16777216
+  max_response_body_bytes: 67108864
 ```
 
 How it works:
@@ -65,6 +77,8 @@ How it works:
 - requests starting with `/static` go to the `/static` backend pool
 - the health checker probes each backend on `/health`
 - only healthy backends stay in the load-balancing pool
+- client headers and bodies are timed out independently from upstream reads
+- request and response bodies are rejected once they exceed configured byte limits
 
 ## Run it
 
@@ -128,7 +142,7 @@ The test backend responds with its port number, so it is easy to see which backe
   Current backend health state.
 
 - `GET /metrics`
-  Simple in-memory metrics and recent health transitions.
+  Prometheus text exposition with request, latency, backend failure, backend health, and error counters.
 
 ## Tests
 
