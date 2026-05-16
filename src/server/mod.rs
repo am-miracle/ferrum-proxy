@@ -13,10 +13,7 @@ use crate::config::Config;
 use crate::http::{AppState, ConnectionInfo, handle_request};
 
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_shutdown(config, async {
-        let _ = signal::ctrl_c().await;
-    })
-    .await
+    run_with_shutdown_kind(config, wait_for_shutdown_signal()).await
 }
 
 pub async fn run_with_shutdown<F>(
@@ -26,6 +23,20 @@ pub async fn run_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    run_with_shutdown_kind(config, async move {
+        shutdown_signal.await;
+        ShutdownReason::Terminate("test")
+    })
+    .await
+}
+
+async fn run_with_shutdown_kind<F>(
+    config: Config,
+    shutdown_signal: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Future<Output = ShutdownReason> + Send,
+{
     let addr = config.server.socket_addr()?;
     let route_count = config.routes.len();
     let state = AppState::new(config);
@@ -33,6 +44,7 @@ where
     state.spawn_background_tasks(shutdown_rx.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let tracker = Arc::new(ConnectionTracker::default());
+    state.run_startup_health_check().await?;
 
     state
         .telemetry()
@@ -83,8 +95,9 @@ where
                     }
                 });
             }
-            _ = &mut shutdown_signal => {
+            reason = &mut shutdown_signal => {
                 let drain_timeout = state.shutdown_timeout();
+                state.telemetry().log_control_signal(reason.signal_name(), reason.action_name());
                 state.telemetry().log_shutdown_started(drain_timeout);
                 let _ = shutdown_tx.send(true);
                 let drained = tracker.wait_for_zero(drain_timeout).await;
@@ -101,6 +114,46 @@ where
 struct ConnectionTracker {
     active: AtomicUsize,
     drained: Notify,
+}
+
+enum ShutdownReason {
+    Terminate(&'static str),
+    // SIGHUP triggers a graceful drain-and-exit; use your process supervisor to re-exec.
+    Reload(&'static str),
+}
+
+impl ShutdownReason {
+    fn signal_name(&self) -> &'static str {
+        match self {
+            Self::Terminate(signal) | Self::Reload(signal) => signal,
+        }
+    }
+
+    fn action_name(&self) -> &'static str {
+        match self {
+            Self::Terminate(_) => "shutdown",
+            Self::Reload(_) => "graceful_shutdown",
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal() -> ShutdownReason {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut hangup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => ShutdownReason::Terminate("ctrl_c"),
+            _ = hangup.recv() => ShutdownReason::Reload("sighup"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+        ShutdownReason::Terminate("ctrl_c")
+    }
 }
 
 impl ConnectionTracker {

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http_body_util::Empty;
 use hyper::body::Bytes;
@@ -22,24 +22,47 @@ pub struct HealthManager {
     telemetry: Option<Arc<Telemetry>>,
     failure_threshold: usize,
     recovery_threshold: usize,
+    ejection_duration: Duration,
+    active_success_status_min: u16,
+    active_success_status_max: u16,
+    passive_failure_status_min: u16,
+    passive_failure_status_max: u16,
 }
 
 struct BackendHealth {
     healthy: AtomicBool,
     consecutive_failures: AtomicUsize,
     consecutive_successes: AtomicUsize,
+    ejected_until: std::sync::Mutex<Option<Instant>>,
+    // true while in the half-open window after ejection expires
+    probing: AtomicBool,
 }
 
 impl HealthManager {
     #[cfg(test)]
     pub fn new(routes: &[RouteConfig]) -> Self {
-        Self::with_telemetry(routes, 3, 2, None)
+        Self::with_telemetry(
+            routes,
+            3,
+            2,
+            Duration::from_secs(30),
+            200,
+            399,
+            500,
+            599,
+            None,
+        )
     }
 
     pub fn with_telemetry(
         routes: &[RouteConfig],
         failure_threshold: usize,
         recovery_threshold: usize,
+        ejection_duration: Duration,
+        active_success_status_min: u16,
+        active_success_status_max: u16,
+        passive_failure_status_min: u16,
+        passive_failure_status_max: u16,
         telemetry: Option<Arc<Telemetry>>,
     ) -> Self {
         let mut backend_health = HashMap::new();
@@ -57,6 +80,11 @@ impl HealthManager {
             telemetry,
             failure_threshold,
             recovery_threshold,
+            ejection_duration,
+            active_success_status_min,
+            active_success_status_max,
+            passive_failure_status_min,
+            passive_failure_status_max,
         }
     }
 
@@ -65,8 +93,20 @@ impl HealthManager {
             .backends
             .iter()
             .map(String::as_str)
-            .filter(|backend| self.is_backend_healthy(backend))
+            .filter(|backend| {
+                // calling is_backend_ejected has a side effect: when the ejection window expires it
+                // transitions the backend into the half-open probing state (probing=true).
+                !self.is_backend_ejected(backend)
+                    && (self.is_backend_healthy(backend) || self.is_backend_probing(backend))
+            })
             .collect()
+    }
+
+    pub fn is_backend_probing(&self, backend: &str) -> bool {
+        self.backend_health
+            .get(backend)
+            .map(|s| s.probing.load(Ordering::Acquire))
+            .unwrap_or(false)
     }
 
     pub fn is_backend_healthy(&self, backend: &str) -> bool {
@@ -80,7 +120,12 @@ impl HealthManager {
         let mut statuses: Vec<_> = self
             .backend_health
             .iter()
-            .map(|(backend, state)| (backend.clone(), state.healthy.load(Ordering::Relaxed)))
+            .map(|(backend, state)| {
+                let ejected = self.is_backend_ejected(backend);
+                let healthy = state.healthy.load(Ordering::Relaxed) && !ejected;
+                let probing = state.probing.load(Ordering::Acquire) && !ejected;
+                (backend.clone(), healthy || probing)
+            })
             .collect();
 
         statuses.sort_by(|left, right| left.0.cmp(&right.0));
@@ -89,9 +134,19 @@ impl HealthManager {
 
     pub fn record_success(&self, backend: &str) {
         if let Some(state) = self.backend_health.get(backend) {
-            state.consecutive_failures.store(0, Ordering::Relaxed); // any success resets the failure streak
-            let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
+            state.consecutive_failures.store(0, Ordering::Relaxed);
 
+            // In the half-open probing window, a single success immediately restores the backend
+            // without waiting for recovery_threshold. This is faster than the normal recovery path.
+            if state.probing.load(Ordering::Acquire) {
+                state.probing.store(false, Ordering::Release);
+                state.healthy.store(true, Ordering::Relaxed);
+                state.consecutive_successes.store(0, Ordering::Relaxed);
+                self.record_transition(backend, "probing", "healthy", "probe_succeeded");
+                return;
+            }
+
+            let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
             if !state.healthy.load(Ordering::Relaxed) && successes >= self.recovery_threshold {
                 state.healthy.store(true, Ordering::Relaxed);
                 state.consecutive_successes.store(0, Ordering::Relaxed);
@@ -102,18 +157,45 @@ impl HealthManager {
 
     pub fn record_failure(&self, backend: &str) {
         if let Some(state) = self.backend_health.get(backend) {
-            state.consecutive_successes.store(0, Ordering::Relaxed); // any failure resets the success streak
+            state.consecutive_successes.store(0, Ordering::Relaxed);
             if let Some(telemetry) = &self.telemetry {
                 telemetry.record_backend_failure(backend);
             }
-            let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
+            // In the half-open probing window, a single failure re-ejects the backend immediately.
+            if state.probing.load(Ordering::Acquire) {
+                state.probing.store(false, Ordering::Release);
+                self.eject_backend(backend);
+                self.record_transition(backend, "probing", "ejected", "probe_failed");
+                return;
+            }
+
+            let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
             if state.healthy.load(Ordering::Relaxed) && failures >= self.failure_threshold {
                 state.healthy.store(false, Ordering::Relaxed);
                 state.consecutive_failures.store(0, Ordering::Relaxed);
+                self.eject_backend(backend);
                 self.record_transition(backend, "healthy", "unhealthy", "failure_threshold");
             }
         }
+    }
+
+    pub fn startup_dead_pools(&self, routes: &[RouteConfig]) -> Vec<String> {
+        routes
+            .iter()
+            .filter(|route| self.healthy_backends(route).is_empty())
+            .map(|route| route.path_prefix.clone())
+            .collect()
+    }
+
+    pub fn is_passive_failure_status(&self, status: StatusCode) -> bool {
+        let status = status.as_u16();
+        status >= self.passive_failure_status_min && status <= self.passive_failure_status_max
+    }
+
+    pub fn is_active_success_status(&self, status: StatusCode) -> bool {
+        let status = status.as_u16();
+        status >= self.active_success_status_min && status <= self.active_success_status_max
     }
 
     fn record_transition(
@@ -127,6 +209,32 @@ impl HealthManager {
             telemetry.record_health_transition(backend, from, to, reason);
         }
     }
+
+    fn eject_backend(&self, backend: &str) {
+        if let Some(state) = self.backend_health.get(backend) {
+            let mut ejected_until = state.ejected_until.lock().expect("ejection lock poisoned");
+            *ejected_until = Some(Instant::now() + self.ejection_duration);
+        }
+    }
+
+    fn is_backend_ejected(&self, backend: &str) -> bool {
+        let Some(state) = self.backend_health.get(backend) else {
+            return false;
+        };
+
+        let mut ejected_until = state.ejected_until.lock().expect("ejection lock poisoned");
+        match *ejected_until {
+            Some(until) if until > Instant::now() => true,
+            Some(_) => {
+                // ejection window expired — enter half-open state so a single probe request
+                // decides whether to fully restore or re-eject the backend.
+                *ejected_until = None;
+                state.probing.store(true, Ordering::Release);
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 impl BackendHealth {
@@ -135,6 +243,8 @@ impl BackendHealth {
             healthy: AtomicBool::new(true),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_successes: AtomicUsize::new(0),
+            ejected_until: std::sync::Mutex::new(None),
+            probing: AtomicBool::new(false),
         }
     }
 }
@@ -164,7 +274,6 @@ pub fn spawn_active_checks(
     })
 }
 
-#[cfg(test)]
 pub async fn run_active_check_pass(config: &Config, manager: &HealthManager) {
     let check_timeout = Duration::from_millis(config.health_check.check_timeout_ms);
     let client = health_client();
@@ -178,15 +287,15 @@ async fn run_active_check_pass_with_client(
     check_timeout: Duration,
 ) {
     for backend in unique_backends(&config.routes) {
-        if check_backend(
+        let check_backend_status = check_backend(
             client,
             backend.as_str(),
             &config.health_check.endpoint,
             check_timeout,
         )
-        .await
-        .is_success()
-        {
+        .await;
+
+        if manager.is_active_success_status(check_backend_status) {
             manager.record_success(backend.as_str());
         } else {
             manager.record_failure(backend.as_str());
@@ -251,6 +360,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU16, Ordering};
+    use std::time::Duration;
 
     use crate::config::{Config, HealthCheckConfig, RouteConfig, ServerConfig};
 
@@ -347,6 +457,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_success_restores_ejected_backend_immediately() {
+        let routes = vec![RouteConfig {
+            path_prefix: "/api".to_string(),
+            backends: vec!["http://127.0.0.1:3001".to_string()],
+        }];
+        let manager = HealthManager::with_telemetry(
+            &routes,
+            1,
+            2, // recovery_threshold=2, but probe succeeds with 1
+            Duration::from_millis(30),
+            200,
+            399,
+            500,
+            599,
+            None,
+        );
+
+        manager.record_failure("http://127.0.0.1:3001");
+        assert!(manager.healthy_backends(&routes[0]).is_empty());
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Ejection expired — calling healthy_backends sets probing=true
+        assert_eq!(
+            manager.healthy_backends(&routes[0]),
+            vec!["http://127.0.0.1:3001"]
+        );
+
+        // Single probe success restores immediately, bypassing recovery_threshold
+        manager.record_success("http://127.0.0.1:3001");
+        assert!(manager.is_backend_healthy("http://127.0.0.1:3001"));
+        assert!(!manager.is_backend_probing("http://127.0.0.1:3001"));
+    }
+
+    #[tokio::test]
+    async fn probe_failure_re_ejects_backend() {
+        let routes = vec![RouteConfig {
+            path_prefix: "/api".to_string(),
+            backends: vec!["http://127.0.0.1:3001".to_string()],
+        }];
+        let manager = HealthManager::with_telemetry(
+            &routes,
+            1,
+            2,
+            Duration::from_millis(30),
+            200,
+            399,
+            500,
+            599,
+            None,
+        );
+
+        manager.record_failure("http://127.0.0.1:3001");
+        assert!(manager.healthy_backends(&routes[0]).is_empty());
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // In probing state — backend is visible for one probe
+        assert_eq!(
+            manager.healthy_backends(&routes[0]),
+            vec!["http://127.0.0.1:3001"]
+        );
+
+        // Probe fails — backend re-ejected immediately
+        manager.record_failure("http://127.0.0.1:3001");
+        assert!(manager.healthy_backends(&routes[0]).is_empty());
+        assert!(!manager.is_backend_probing("http://127.0.0.1:3001"));
+    }
+
+    #[tokio::test]
+    async fn keeps_backend_ejected_until_cooldown_expires() {
+        let routes = vec![RouteConfig {
+            path_prefix: "/api".to_string(),
+            backends: vec!["http://127.0.0.1:3001".to_string()],
+        }];
+        let manager = HealthManager::with_telemetry(
+            &routes,
+            1,
+            1,
+            Duration::from_millis(50),
+            200,
+            399,
+            500,
+            599,
+            None,
+        );
+
+        manager.record_failure("http://127.0.0.1:3001");
+        manager.record_success("http://127.0.0.1:3001");
+        assert!(manager.healthy_backends(&routes[0]).is_empty());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            manager.healthy_backends(&routes[0]),
+            vec!["http://127.0.0.1:3001"]
+        );
+    }
+
+    #[tokio::test]
     async fn active_checks_mark_backend_unhealthy_after_failed_checks() {
         let backend = "http://127.0.0.1:9";
         let config = config_with_backends(vec![backend.to_string()]);
@@ -406,6 +615,8 @@ mod tests {
                 ..Default::default()
             },
             upstream: crate::config::UpstreamConfig::default(),
+            retry: crate::config::RetryConfig::default(),
+            debug: crate::config::DebugConfig::default(),
         }
     }
 

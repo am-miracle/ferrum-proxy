@@ -13,6 +13,8 @@
 - hardened forwarding and hop-by-hop header handling
 - request and response size limits
 - upstream connect and read timeouts
+- bounded retries for safe and idempotent requests
+- temporary backend ejection for flapping upstreams
 - Prometheus-style metrics export
 
 ## Current status
@@ -63,12 +65,30 @@ routes:
 health_check:
   interval_sec: 10
   endpoint: /health
+  failure_threshold: 3
+  recovery_threshold: 2
+  ejection_duration_ms: 30000
+  active_success_status_min: 200
+  active_success_status_max: 399
+  passive_failure_status_min: 500
+  passive_failure_status_max: 599
 
 upstream:
   connect_timeout_ms: 3000
   read_timeout_ms: 15000
   max_request_body_bytes: 16777216
   max_response_body_bytes: 67108864
+
+retry:
+  max_attempts: 2
+  total_timeout_ms: 5000
+  backoff_ms: 50
+  retry_on_statuses: [502, 503, 504]
+
+debug:
+  expose_backend_health: true
+  expose_metrics: true
+  auth_token: change-me
 ```
 
 How it works:
@@ -79,6 +99,9 @@ How it works:
 - only healthy backends stay in the load-balancing pool
 - client headers and bodies are timed out independently from upstream reads
 - request and response bodies are rejected once they exceed configured byte limits
+- safe and idempotent requests can be retried within a bounded total timeout
+- repeated backend failures trigger temporary ejection before active checks recover them
+- debug endpoints can be hidden or protected with a bearer token
 
 ## Run it
 
@@ -87,6 +110,7 @@ cargo run
 ```
 
 The proxy starts on the configured host and port.
+On Unix-like systems, `SIGHUP` triggers a graceful controlled restart workflow: the proxy drains connections and exits so a supervisor can start it again with fresh config.
 
 ## Local test setup
 
@@ -139,10 +163,10 @@ The test backend responds with its port number, so it is easy to see which backe
   Health of the proxy process itself.
 
 - `GET /health/backends`
-  Current backend health state.
+  Current backend health state. Can be disabled or protected with a bearer token.
 
 - `GET /metrics`
-  Prometheus text exposition with request, latency, backend failure, backend health, and error counters.
+  Prometheus text exposition with request, latency, backend failure, backend health, and error counters. Can be disabled or protected with a bearer token.
 
 ## Tests
 
@@ -158,7 +182,65 @@ The repo has:
 - integration tests for request-path behavior
 - black-box tests that start the real server and hit it over HTTP
 
+## Benchmarks
+
+This repo benchmarks the live proxy with `wrk`, not a function-level microbenchmark.
+
+Install `wrk`, then run:
+
+```bash
+cargo run --release --bin benchmark_runner --
+```
+
+The runner builds the release binaries, starts dedicated local benchmark backends, runs warmup and measured `wrk` passes, and stores results under `benchmark-results/<timestamp>/`.
+
+The default benchmark suite covers:
+
+- `healthy_get`
+  steady-state GET traffic through healthy backends
+- `large_response`
+  large streamed upstream responses
+- `retry_get`
+  one failing backend plus one healthy backend to measure retry cost
+- `upload_post`
+  `POST` requests with a 64 KiB request body
+
+Useful commands:
+
+```bash
+cargo run --release --bin benchmark_runner -- --scenarios healthy_get,retry_get
+cargo run --release --bin benchmark_runner -- --warmup 10s --duration 30s
+cargo run --release --bin benchmark_runner -- --skip-build
+```
+
+The benchmark output is the native `wrk` report, for example:
+
+```text
+Running 30s test @ http://127.0.0.1:63580/api/users
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.69ms    4.79ms 123.96ms   93.34%
+    Req/Sec     6.24k     1.10k    7.79k    70.51%
+  Latency Distribution
+     50%    3.65ms
+     75%    4.76ms
+     90%    7.33ms
+     99%   25.20ms
+  747182 requests in 30.10s, 0.86GB read
+Requests/sec:  24822.42
+Transfer/sec:     29.43MB
+```
+
+Focus on:
+
+- `Requests/sec` for throughput
+- `Latency Distribution`, especially `90%` and `99%`
+- `Transfer/sec` for body-heavy scenarios
+
+For more detail, see [docs/benchmarking.md](docs/benchmarking.md).
+
 ## Docs
 
 - [docs/architecture.md](docs/architecture.md)
+- [docs/benchmarking.md](docs/benchmarking.md)
 - [docs/production-readiness.md](docs/production-readiness.md)

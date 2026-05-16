@@ -13,6 +13,10 @@ pub struct Config {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub debug: DebugConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -25,6 +29,9 @@ pub struct ServerConfig {
     pub client_header_timeout_ms: u64,
     #[serde(default = "default_client_body_timeout_ms")]
     pub client_body_timeout_ms: u64,
+    /// abort startup if any route has no reachable backends after the initial health check pass.
+    #[serde(default)]
+    pub fail_on_startup_dead_pool: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -43,6 +50,16 @@ pub struct HealthCheckConfig {
     pub failure_threshold: usize,
     #[serde(default = "default_recovery_threshold")]
     pub recovery_threshold: usize,
+    #[serde(default = "default_ejection_duration_ms")]
+    pub ejection_duration_ms: u64,
+    #[serde(default = "default_active_success_status_min")]
+    pub active_success_status_min: u16,
+    #[serde(default = "default_active_success_status_max")]
+    pub active_success_status_max: u16,
+    #[serde(default = "default_passive_failure_status_min")]
+    pub passive_failure_status_min: u16,
+    #[serde(default = "default_passive_failure_status_max")]
+    pub passive_failure_status_max: u16,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -55,6 +72,37 @@ pub struct UpstreamConfig {
     pub max_request_body_bytes: u64,
     #[serde(default = "default_max_response_body_bytes")]
     pub max_response_body_bytes: u64,
+    /// maximum number of request bodies that may be buffered in memory simultaneously.
+    /// requests that arrive when this limit is reached receive 503 immediately.
+    #[serde(default = "default_max_buffered_bodies")]
+    pub max_buffered_bodies: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_retry_max_attempts")]
+    pub max_attempts: usize,
+    #[serde(default = "default_retry_total_timeout_ms")]
+    pub total_timeout_ms: u64,
+    /// base backoff between retry attempts. actual delay doubles each attempt (exponential backoff).
+    #[serde(default = "default_retry_backoff_ms")]
+    pub backoff_ms: u64,
+    #[serde(default = "default_retry_on_statuses")]
+    pub retry_on_statuses: Vec<u16>,
+    /// also retry PUT and DELETE. These are idempotent by spec but not always safe to replay
+    /// in practice (partial state changes, side effects). Disabled by default.
+    #[serde(default)]
+    pub retry_idempotent_methods: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DebugConfig {
+    #[serde(default = "default_expose_backend_health")]
+    pub expose_backend_health: bool,
+    #[serde(default = "default_expose_metrics")]
+    pub expose_metrics: bool,
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -118,6 +166,8 @@ impl Config {
 
         self.health_check.validate()?;
         self.upstream.validate()?;
+        self.retry.validate()?;
+        self.debug.validate()?;
 
         Ok(())
     }
@@ -246,6 +296,28 @@ impl HealthCheckConfig {
             ));
         }
 
+        if self.ejection_duration_ms == 0 {
+            return Err(ConfigError::Validation(
+                "health_check.ejection_duration_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.active_success_status_min == 0
+            || self.active_success_status_min > self.active_success_status_max
+        {
+            return Err(ConfigError::Validation(
+                "health_check active success status range must be valid".to_string(),
+            ));
+        }
+
+        if self.passive_failure_status_min == 0
+            || self.passive_failure_status_min > self.passive_failure_status_max
+        {
+            return Err(ConfigError::Validation(
+                "health_check passive failure status range must be valid".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -258,6 +330,11 @@ impl Default for HealthCheckConfig {
             check_timeout_ms: default_check_timeout_ms(),
             failure_threshold: default_failure_threshold(),
             recovery_threshold: default_recovery_threshold(),
+            ejection_duration_ms: default_ejection_duration_ms(),
+            active_success_status_min: default_active_success_status_min(),
+            active_success_status_max: default_active_success_status_max(),
+            passive_failure_status_min: default_passive_failure_status_min(),
+            passive_failure_status_max: default_passive_failure_status_max(),
         }
     }
 }
@@ -270,6 +347,7 @@ impl Default for ServerConfig {
             graceful_shutdown_timeout_ms: default_graceful_shutdown_timeout_ms(),
             client_header_timeout_ms: default_client_header_timeout_ms(),
             client_body_timeout_ms: default_client_body_timeout_ms(),
+            fail_on_startup_dead_pool: false,
         }
     }
 }
@@ -300,6 +378,12 @@ impl UpstreamConfig {
             ));
         }
 
+        if self.max_buffered_bodies == 0 {
+            return Err(ConfigError::Validation(
+                "upstream.max_buffered_bodies must be greater than 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -311,6 +395,70 @@ impl Default for UpstreamConfig {
             read_timeout_ms: default_read_timeout_ms(),
             max_request_body_bytes: default_max_request_body_bytes(),
             max_response_body_bytes: default_max_response_body_bytes(),
+            max_buffered_bodies: default_max_buffered_bodies(),
+        }
+    }
+}
+
+impl RetryConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_attempts == 0 {
+            return Err(ConfigError::Validation(
+                "retry.max_attempts must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.total_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "retry.total_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        for status in &self.retry_on_statuses {
+            if *status < 100 {
+                return Err(ConfigError::Validation(format!(
+                    "retry.retry_on_statuses contains invalid status code '{}'",
+                    status
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_retry_max_attempts(),
+            total_timeout_ms: default_retry_total_timeout_ms(),
+            backoff_ms: default_retry_backoff_ms(),
+            retry_on_statuses: default_retry_on_statuses(),
+            retry_idempotent_methods: false,
+        }
+    }
+}
+
+impl DebugConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(token) = &self.auth_token {
+            if token.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "debug.auth_token must not be empty when provided".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            expose_backend_health: default_expose_backend_health(),
+            expose_metrics: default_expose_metrics(),
+            auth_token: None,
         }
     }
 }
@@ -343,6 +491,10 @@ fn default_max_response_body_bytes() -> u64 {
     64 * 1024 * 1024
 }
 
+fn default_max_buffered_bodies() -> usize {
+    100
+}
+
 fn default_check_timeout_ms() -> u64 {
     5_000
 }
@@ -353,6 +505,50 @@ fn default_failure_threshold() -> usize {
 
 fn default_recovery_threshold() -> usize {
     2
+}
+
+fn default_ejection_duration_ms() -> u64 {
+    30_000
+}
+
+fn default_active_success_status_min() -> u16 {
+    200
+}
+
+fn default_active_success_status_max() -> u16 {
+    399
+}
+
+fn default_passive_failure_status_min() -> u16 {
+    500
+}
+
+fn default_passive_failure_status_max() -> u16 {
+    599
+}
+
+fn default_retry_max_attempts() -> usize {
+    1
+}
+
+fn default_retry_total_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    50
+}
+
+fn default_retry_on_statuses() -> Vec<u16> {
+    vec![502, 503, 504]
+}
+
+fn default_expose_backend_health() -> bool {
+    true
+}
+
+fn default_expose_metrics() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -531,6 +727,50 @@ health_check:
 upstream:
   max_request_body_bytes: 0
   max_response_body_bytes: 1
+"#,
+        );
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_retry_config() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 127.0.0.1
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+health_check:
+  interval_sec: 10
+  endpoint: /health
+retry:
+  max_attempts: 0
+"#,
+        );
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_debug_auth_token() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 127.0.0.1
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+health_check:
+  interval_sec: 10
+  endpoint: /health
+debug:
+  auth_token: "   "
 "#,
         );
 

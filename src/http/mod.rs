@@ -1,16 +1,26 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::upstream::{ProxyBody, UpstreamClient, bad_gateway_response, full_body};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use tokio_stream::StreamExt;
 
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> String {
+    let id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{id:016x}")
+}
+
 use crate::balancing::RoundRobinBalancer;
-use crate::config::Config;
-use crate::health::{HealthManager, spawn_active_checks};
+use crate::config::{Config, RouteConfig};
+use crate::health::{HealthManager, run_active_check_pass, spawn_active_checks};
 use crate::routing::match_route;
 use crate::telemetry::Telemetry;
 
@@ -21,6 +31,7 @@ pub struct AppState {
     health: Arc<HealthManager>,
     telemetry: Arc<Telemetry>,
     upstream: UpstreamClient,
+    buffer_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -31,12 +42,18 @@ pub(crate) struct ConnectionInfo {
 impl AppState {
     pub fn new(config: Config) -> Self {
         let upstream_config = config.upstream.clone();
+        let max_buffered_bodies = config.upstream.max_buffered_bodies;
         let telemetry = Arc::new(Telemetry::new(&config.routes));
         let balancer = Arc::new(RoundRobinBalancer::new(&config.routes));
         let health = Arc::new(HealthManager::with_telemetry(
             &config.routes,
             config.health_check.failure_threshold,
             config.health_check.recovery_threshold,
+            Duration::from_millis(config.health_check.ejection_duration_ms),
+            config.health_check.active_success_status_min,
+            config.health_check.active_success_status_max,
+            config.health_check.passive_failure_status_min,
+            config.health_check.passive_failure_status_max,
             Some(telemetry.clone()),
         ));
 
@@ -46,6 +63,7 @@ impl AppState {
             health,
             telemetry,
             upstream: UpstreamClient::new(&upstream_config),
+            buffer_semaphore: Arc::new(tokio::sync::Semaphore::new(max_buffered_bodies)),
         }
     }
 
@@ -74,20 +92,68 @@ impl AppState {
     pub fn client_header_timeout(&self) -> Duration {
         Duration::from_millis(self.config.server.client_header_timeout_ms)
     }
+
+    pub fn should_retry_status(&self, status: StatusCode) -> bool {
+        self.config
+            .retry
+            .retry_on_statuses
+            .contains(&status.as_u16())
+    }
+
+    pub async fn run_startup_health_check(&self) -> Result<(), Box<dyn std::error::Error>> {
+        run_active_check_pass(&self.config, &self.health).await;
+        let dead_pools = self.health.startup_dead_pools(&self.config.routes);
+        for pool in &dead_pools {
+            self.telemetry
+                .log_startup_warning(pool.as_str(), "all_backends_unavailable");
+        }
+        if self.config.server.fail_on_startup_dead_pool && !dead_pools.is_empty() {
+            return Err(format!(
+                "startup aborted: {} route(s) have no reachable backends: {}",
+                dead_pools.len(),
+                dead_pools.join(", ")
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
-pub async fn handle_request<B>(request: Request<B>, state: AppState) -> Response<ProxyBody>
+pub async fn handle_request<B>(mut request: Request<B>, state: AppState) -> Response<ProxyBody>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     state.telemetry.record_request();
 
+    // Preserve an existing X-Request-ID from the client, or generate a new one. The header is
+    // forwarded to upstreams so proxy logs and backend logs share a correlation handle.
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(next_request_id);
+    if let Ok(val) = HeaderValue::from_str(&request_id) {
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), val);
+    }
+
     let method = request.method().clone();
     let path = request.uri().path().to_string();
 
-    if let Some(response) = handle_internal_route(request.method(), request.uri().path(), &state) {
-        return complete_request(&state, &method, &path, None, Instant::now(), response, None);
+    if let Some(response) = handle_internal_route(&request, &state) {
+        return complete_request(
+            &state,
+            &method,
+            &path,
+            None,
+            Instant::now(),
+            response,
+            None,
+            &request_id,
+        );
     }
 
     if let Some(content_length) =
@@ -108,6 +174,7 @@ where
                 ),
             ),
             Some("request_body_too_large"),
+            &request_id,
         );
     }
 
@@ -120,30 +187,8 @@ where
             Instant::now(),
             text_response(StatusCode::NOT_FOUND, "no route matched request path\n"),
             None,
+            &request_id,
         );
-    };
-
-    let healthy_backends = state.health.healthy_backends(route);
-    let backend = match state
-        .balancer
-        .select_backend(&route.path_prefix, &healthy_backends)
-    {
-        Some(backend) => backend,
-        None => {
-            state.telemetry.record_proxy_error("no_healthy_backends");
-            return complete_request(
-                &state,
-                &method,
-                &path,
-                None,
-                Instant::now(),
-                text_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no healthy backends available\n",
-                ),
-                Some("no_healthy_backends"),
-            );
-        }
     };
 
     let client_addr = request
@@ -153,7 +198,28 @@ where
     let started = Instant::now();
 
     let client_body_timeout = Duration::from_millis(state.config.server.client_body_timeout_ms);
-    if should_prebuffer_request(&method) {
+    if should_retry_request(&state, &method) {
+        let _permit = match state.buffer_semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                state
+                    .telemetry
+                    .record_proxy_error("buffer_capacity_exceeded");
+                return complete_request(
+                    &state,
+                    &method,
+                    &path,
+                    None,
+                    started,
+                    text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "too many concurrent buffered requests\n",
+                    ),
+                    Some("buffer_capacity_exceeded"),
+                    &request_id,
+                );
+            }
+        };
         match buffer_request_body(
             request,
             state.upstream.max_request_body_bytes(),
@@ -161,16 +227,18 @@ where
         )
         .await
         {
-            Ok(request) => {
-                forward_request(
+            Ok(buffered) => {
+                drop(_permit);
+                forward_with_retries(
                     &state,
+                    route,
                     &method,
                     &path,
-                    backend,
-                    request,
+                    buffered,
                     client_addr,
                     started,
                     client_body_timeout,
+                    &request_id,
                 )
                 .await
             }
@@ -181,25 +249,202 @@ where
                     &state,
                     &method,
                     &path,
-                    Some(backend),
+                    None,
                     started,
                     err.into_response(),
                     Some(kind),
+                    &request_id,
+                )
+            }
+        }
+    } else if should_prebuffer_request(&method) {
+        let backend = match select_backend(&state, route, None) {
+            Some(backend) => backend,
+            None => return no_healthy_backends_response(&state, &method, &path, &request_id),
+        };
+
+        let _permit = match state.buffer_semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                state
+                    .telemetry
+                    .record_proxy_error("buffer_capacity_exceeded");
+                return complete_request(
+                    &state,
+                    &method,
+                    &path,
+                    Some(backend.as_str()),
+                    started,
+                    text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "too many concurrent buffered requests\n",
+                    ),
+                    Some("buffer_capacity_exceeded"),
+                    &request_id,
+                );
+            }
+        };
+        match buffer_request_body(
+            request,
+            state.upstream.max_request_body_bytes(),
+            client_body_timeout,
+        )
+        .await
+        {
+            Ok(buffered) => {
+                drop(_permit);
+                forward_request(
+                    &state,
+                    &method,
+                    &path,
+                    backend.as_str(),
+                    buffered.map(Full::new),
+                    client_addr,
+                    started,
+                    client_body_timeout,
+                    &request_id,
+                )
+                .await
+            }
+            Err(err) => {
+                let kind = err.kind();
+                state.telemetry.record_proxy_error(kind);
+                complete_request(
+                    &state,
+                    &method,
+                    &path,
+                    Some(backend.as_str()),
+                    started,
+                    err.into_response(),
+                    Some(kind),
+                    &request_id,
                 )
             }
         }
     } else {
+        let backend = match select_backend(&state, route, None) {
+            Some(backend) => backend,
+            None => return no_healthy_backends_response(&state, &method, &path, &request_id),
+        };
+
         forward_request(
             &state,
             &method,
             &path,
-            backend,
+            backend.as_str(),
             request,
             client_addr,
             started,
             client_body_timeout,
+            &request_id,
         )
         .await
+    }
+}
+
+async fn forward_with_retries(
+    state: &AppState,
+    route: &RouteConfig,
+    method: &Method,
+    path: &str,
+    request: Request<Bytes>,
+    client_addr: Option<SocketAddr>,
+    started: Instant,
+    client_body_timeout: Duration,
+    request_id: &str,
+) -> Response<ProxyBody> {
+    let replayable = ReplayableRequest::from(request);
+    let max_attempts = state.config.retry.max_attempts;
+    let total_timeout = Duration::from_millis(state.config.retry.total_timeout_ms);
+    let base_backoff_ms = state.config.retry.backoff_ms;
+    let mut attempted_backends = HashSet::new();
+    let mut attempt = 1usize;
+
+    loop {
+        if started.elapsed() >= total_timeout {
+            state.telemetry.record_proxy_error("retry_budget_exhausted");
+            return complete_request(
+                state,
+                method,
+                path,
+                None,
+                started,
+                text_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "retry budget exhausted before a successful upstream response\n",
+                ),
+                Some("retry_budget_exhausted"),
+                request_id,
+            );
+        }
+
+        let backend = match select_backend(state, route, Some(&attempted_backends)) {
+            Some(backend) => backend,
+            None => {
+                if attempt == 1 {
+                    return no_healthy_backends_response(state, method, path, request_id);
+                }
+
+                state.telemetry.record_proxy_error("retry_exhausted");
+                return complete_request(
+                    state,
+                    method,
+                    path,
+                    None,
+                    started,
+                    text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "retry attempts exhausted with no healthy backends remaining\n",
+                    ),
+                    Some("retry_exhausted"),
+                    request_id,
+                );
+            }
+        };
+        attempted_backends.insert(backend.clone());
+
+        let response = forward_request(
+            state,
+            method,
+            path,
+            backend.as_str(),
+            replayable.to_request(),
+            client_addr,
+            started,
+            client_body_timeout,
+            request_id,
+        )
+        .await;
+
+        let status = response.status();
+        if !should_retry_response(state, status)
+            || attempt >= max_attempts
+            || started.elapsed() >= total_timeout
+        {
+            return response;
+        }
+
+        state.telemetry.log_retry_attempt(
+            method.as_str(),
+            path,
+            backend.as_str(),
+            attempt + 1,
+            "retryable_status",
+        );
+
+        // exponential backoff: base * 2^(attempt-1), capped by the remaining timeout budget.
+        if base_backoff_ms > 0 {
+            let backoff = Duration::from_millis(
+                base_backoff_ms.saturating_mul(1u64 << (attempt - 1).min(10)),
+            );
+            let remaining = total_timeout.saturating_sub(started.elapsed());
+            if backoff >= remaining {
+                return response;
+            }
+            tokio::time::sleep(backoff).await;
+        }
+
+        attempt += 1;
     }
 }
 
@@ -212,6 +457,7 @@ async fn forward_request<B>(
     client_addr: Option<SocketAddr>,
     started: Instant,
     client_body_timeout: Duration,
+    request_id: &str,
 ) -> Response<ProxyBody>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
@@ -224,13 +470,22 @@ where
     {
         Ok(response) => {
             state.telemetry.record_upstream_latency(started.elapsed());
-            if response.status().is_server_error() {
+            if state.health.is_passive_failure_status(response.status()) {
                 state.health.record_failure(backend);
             } else {
                 state.health.record_success(backend);
             }
 
-            complete_request(state, method, path, Some(backend), started, response, None)
+            complete_request(
+                state,
+                method,
+                path,
+                Some(backend),
+                started,
+                response,
+                None,
+                request_id,
+            )
         }
         Err(err) => {
             state.telemetry.record_upstream_latency(started.elapsed());
@@ -244,6 +499,7 @@ where
                 started,
                 bad_gateway_response(&err),
                 Some(err.kind()),
+                request_id,
             )
         }
     }
@@ -253,7 +509,7 @@ async fn buffer_request_body<B>(
     request: Request<B>,
     max_bytes: u64,
     idle_timeout: Duration,
-) -> Result<Request<Full<Bytes>>, RequestBufferError>
+) -> Result<Request<Bytes>, RequestBufferError>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -283,7 +539,7 @@ where
         }
     }
 
-    Ok(Request::from_parts(parts, Full::new(Bytes::from(buffered))))
+    Ok(Request::from_parts(parts, Bytes::from(buffered)))
 }
 
 fn should_prebuffer_request(method: &Method) -> bool {
@@ -329,14 +585,57 @@ impl RequestBufferError {
     }
 }
 
+struct ReplayableRequest {
+    method: Method,
+    uri: hyper::Uri,
+    version: hyper::Version,
+    headers: hyper::HeaderMap<HeaderValue>,
+    body: Bytes,
+}
+
+impl ReplayableRequest {
+    fn to_request(&self) -> Request<Full<Bytes>> {
+        let mut builder = Request::builder()
+            .method(self.method.clone())
+            .uri(self.uri.clone())
+            .version(self.version);
+
+        if let Some(headers) = builder.headers_mut() {
+            *headers = self.headers.clone();
+            if let Ok(content_length) = HeaderValue::from_str(&self.body.len().to_string()) {
+                headers.insert(CONTENT_LENGTH, content_length);
+            }
+        }
+
+        builder
+            .body(Full::new(self.body.clone()))
+            .expect("invalid replay request")
+    }
+}
+
+impl From<Request<Bytes>> for ReplayableRequest {
+    fn from(request: Request<Bytes>) -> Self {
+        let (parts, body) = request.into_parts();
+
+        Self {
+            method: parts.method,
+            uri: parts.uri,
+            version: parts.version,
+            headers: parts.headers,
+            body,
+        }
+    }
+}
+
 fn complete_request(
     state: &AppState,
     method: &Method,
     path: &str,
     backend: Option<&str>,
     started: Instant,
-    response: Response<ProxyBody>,
+    mut response: Response<ProxyBody>,
     error_kind: Option<&'static str>,
+    request_id: &str,
 ) -> Response<ProxyBody> {
     let status = response.status();
     state.telemetry.record_response_status(status.as_u16());
@@ -347,20 +646,44 @@ fn complete_request(
         status.as_u16(),
         started.elapsed(),
         error_kind,
+        request_id,
     );
+    if let Ok(val) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), val);
+    }
     response
 }
 
 fn handle_internal_route(
-    method: &Method,
-    path: &str,
+    request: &Request<impl hyper::body::Body>,
     state: &AppState,
 ) -> Option<Response<ProxyBody>> {
+    let method = request.method();
+    let path = request.uri().path();
+
     match (method, path) {
         (&Method::GET, "/") => Some(root_response(state)),
         (&Method::GET, "/health") => Some(text_response(StatusCode::OK, "ok\n")),
-        (&Method::GET, "/health/backends") => Some(backend_health_response(state)),
-        (&Method::GET, "/metrics") => Some(metrics_response(state)),
+        (&Method::GET, "/health/backends") => {
+            if !state.config.debug.expose_backend_health {
+                None
+            } else if !debug_request_authorized(request, state) {
+                Some(unauthorized_debug_response())
+            } else {
+                Some(backend_health_response(state))
+            }
+        }
+        (&Method::GET, "/metrics") => {
+            if !state.config.debug.expose_metrics {
+                None
+            } else if !debug_request_authorized(request, state) {
+                Some(unauthorized_debug_response())
+            } else {
+                Some(metrics_response(state))
+            }
+        }
         _ => None,
     }
 }
@@ -390,12 +713,15 @@ fn backend_health_response(state: &AppState) -> Response<ProxyBody> {
 }
 
 fn metrics_response(state: &AppState) -> Response<ProxyBody> {
-    text_response(
-        StatusCode::OK,
-        state
-            .telemetry
-            .render_prometheus(&state.health.backend_statuses()),
-    )
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(full_body(
+            state
+                .telemetry
+                .render_prometheus(&state.health.backend_statuses()),
+        ))
+        .expect("invalid metrics response")
 }
 
 fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ProxyBody> {
@@ -410,7 +736,7 @@ fn content_length_exceeds(
     limit: u64,
 ) -> Option<u64> {
     headers
-        .get(hyper::header::CONTENT_LENGTH)?
+        .get(CONTENT_LENGTH)?
         .to_str()
         .ok()?
         .parse::<u64>()
@@ -418,11 +744,93 @@ fn content_length_exceeds(
         .filter(|content_length| *content_length > limit)
 }
 
+fn no_healthy_backends_response(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    request_id: &str,
+) -> Response<ProxyBody> {
+    state.telemetry.record_proxy_error("no_healthy_backends");
+    complete_request(
+        state,
+        method,
+        path,
+        None,
+        Instant::now(),
+        text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no healthy backends available\n",
+        ),
+        Some("no_healthy_backends"),
+        request_id,
+    )
+}
+
+fn select_backend<'a>(
+    state: &'a AppState,
+    route: &'a RouteConfig,
+    attempted_backends: Option<&HashSet<String>>,
+) -> Option<String> {
+    let healthy_backends = state.health.healthy_backends(route);
+    let eligible: Vec<_> = match attempted_backends {
+        Some(attempted_backends) => healthy_backends
+            .into_iter()
+            .filter(|backend| !attempted_backends.contains(*backend))
+            .collect(),
+        None => healthy_backends,
+    };
+
+    state
+        .balancer
+        .select_backend(&route.path_prefix, &eligible)
+        .map(str::to_string)
+}
+
+fn should_retry_request(state: &AppState, method: &Method) -> bool {
+    state.config.retry.max_attempts > 1
+        && is_retryable_method(method, state.config.retry.retry_idempotent_methods)
+}
+
+// GET/HEAD/OPTIONS/TRACE are always safe to replay. PUT/DELETE are idempotent per spec but
+// not always safe to replay in practice (they may have partial side effects before a 5xx).
+// Opt in via retry.retry_idempotent_methods.
+fn is_retryable_method(method: &Method, retry_idempotent: bool) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    ) || (retry_idempotent && matches!(*method, Method::PUT | Method::DELETE))
+}
+
+fn should_retry_response(state: &AppState, status: StatusCode) -> bool {
+    state.should_retry_status(status)
+}
+
+fn debug_request_authorized(request: &Request<impl hyper::body::Body>, state: &AppState) -> bool {
+    let Some(expected_token) = &state.config.debug.auth_token else {
+        return true;
+    };
+
+    let expected = format!("Bearer {expected_token}");
+    request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(expected.as_str())
+}
+
+fn unauthorized_debug_response() -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("www-authenticate", HeaderValue::from_static("Bearer"))
+        .body(full_body("debug endpoint requires bearer authentication\n"))
+        .expect("invalid debug auth response")
+}
+
 #[cfg(test)]
 mod tests {
     use http_body_util::{BodyExt, Empty, Full, StreamBody};
     use hyper::body::{Bytes, Frame};
-    use hyper::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue};
+    use hyper::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue};
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper::{Method, Request, Response, StatusCode};
@@ -465,6 +873,8 @@ mod tests {
                 ..Default::default()
             },
             upstream: UpstreamConfig::default(),
+            retry: crate::config::RetryConfig::default(),
+            debug: crate::config::DebugConfig::default(),
         }
     }
 
@@ -506,6 +916,63 @@ mod tests {
         assert!(text.contains("# TYPE ferrum_proxy_requests_total counter"));
         assert!(text.contains("ferrum_proxy_requests_total 2"));
         assert!(text.contains("ferrum_proxy_backend_healthy"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_requires_bearer_token_when_configured() {
+        let state = state_with_config(Config {
+            debug: crate::config::DebugConfig {
+                auth_token: Some("secret-token".to_string()),
+                ..Default::default()
+            },
+            ..sample_config()
+        });
+
+        let unauthorized = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .header(AUTHORIZATION, "Bearer secret-token")
+                .body(empty_body())
+                .unwrap(),
+            state,
+        )
+        .await;
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_can_be_disabled() {
+        let state = state_with_config(Config {
+            debug: crate::config::DebugConfig {
+                expose_metrics: false,
+                ..Default::default()
+            },
+            ..sample_config()
+        });
+
+        let response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(empty_body())
+                .unwrap(),
+            state,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -678,6 +1145,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_safe_request_on_retryable_status() {
+        let first = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Full::new(Bytes::from_static(b"retry me")))
+                .unwrap()
+        })
+        .await;
+        let second = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from_static(b"healthy-backend")))
+                .unwrap()
+        })
+        .await;
+
+        let state = state_with_config(Config {
+            routes: vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                backends: vec![first, second],
+            }],
+            retry: crate::config::RetryConfig {
+                max_attempts: 2,
+                retry_on_statuses: vec![503],
+                ..Default::default()
+            },
+            ..sample_config()
+        });
+
+        let response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state,
+        )
+        .await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, Bytes::from_static(b"healthy-backend"));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_post_request_even_when_retry_is_enabled() {
+        let seen_requests = Arc::new(AtomicUsize::new(0));
+        let first = spawn_test_upstream({
+            let seen_requests = seen_requests.clone();
+            move |_| {
+                let seen_requests = seen_requests.clone();
+                async move {
+                    seen_requests.fetch_add(1, Ordering::Relaxed);
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Full::new(Bytes::from_static(b"retry me")))
+                        .unwrap()
+                }
+            }
+        })
+        .await;
+        let second = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from_static(b"should-not-run")))
+                .unwrap()
+        })
+        .await;
+
+        let state = state_with_config(Config {
+            routes: vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                backends: vec![first, second],
+            }],
+            retry: crate::config::RetryConfig {
+                max_attempts: 2,
+                retry_on_statuses: vec![503],
+                ..Default::default()
+            },
+            ..sample_config()
+        });
+
+        let response = handle_request(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/users")
+                .body(Full::new(Bytes::from_static(b"small")))
+                .unwrap(),
+            state,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(seen_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn unknown_route_returns_not_found() {
         let request = Request::builder()
             .method(Method::GET)
@@ -755,6 +1320,8 @@ mod tests {
                 ..Default::default()
             },
             upstream: UpstreamConfig::default(),
+            retry: crate::config::RetryConfig::default(),
+            debug: crate::config::DebugConfig::default(),
         })
     }
 

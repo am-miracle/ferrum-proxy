@@ -248,6 +248,8 @@ fn config(port: u16, routes: Vec<RouteConfig>) -> Config {
             ..Default::default()
         },
         upstream: UpstreamConfig::default(),
+        retry: ferrum_proxy::config::RetryConfig::default(),
+        debug: ferrum_proxy::config::DebugConfig::default(),
     }
 }
 

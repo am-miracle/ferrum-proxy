@@ -168,6 +168,44 @@ impl Telemetry {
         );
     }
 
+    pub fn log_startup_warning(&self, route: &str, reason: &str) {
+        self.log(
+            "WARN",
+            "startup_warning",
+            &[("route", route), ("reason", reason)],
+        );
+    }
+
+    pub fn log_retry_attempt(
+        &self,
+        method: &str,
+        path: &str,
+        backend: &str,
+        attempt: usize,
+        reason: &str,
+    ) {
+        let attempt = attempt.to_string();
+        self.log(
+            "INFO",
+            "retry_attempt",
+            &[
+                ("method", method),
+                ("path", path),
+                ("backend", backend),
+                ("attempt", attempt.as_str()),
+                ("reason", reason),
+            ],
+        );
+    }
+
+    pub fn log_control_signal(&self, signal: &str, action: &str) {
+        self.log(
+            "INFO",
+            "control_signal",
+            &[("signal", signal), ("action", action)],
+        );
+    }
+
     pub fn log_request_complete(
         &self,
         method: &str,
@@ -176,6 +214,7 @@ impl Telemetry {
         status: u16,
         latency: Duration,
         error_kind: Option<&'static str>,
+        request_id: &str,
     ) {
         let status = status.to_string();
         let latency_ms = latency.as_millis().to_string();
@@ -186,6 +225,7 @@ impl Telemetry {
             "INFO",
             "request_complete",
             &[
+                ("request_id", request_id),
                 ("method", method),
                 ("path", path),
                 ("backend", backend),

@@ -83,13 +83,3 @@ these items improve scale, maintainability, and operational maturity.
 
 - add runbooks.
   Document what `503`, unhealthy backends, timeout spikes, and transition logs mean operationally.
-
-## recommended next five
-
-the next five items should be:
-
-1. Graceful shutdown and connection draining
-2. Header hardening
-3. Structured logging and real metrics export
-4. Request and response size limits
-5. Configurable health and retry policy
