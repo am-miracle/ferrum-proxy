@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::error::Error as StdError;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::combinators::UnsyncBoxBody;
@@ -32,8 +34,6 @@ const KEEP_ALIVE: &str = "keep-alive";
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: Client<HttpConnector, ProxyBody>,
-    connect_timeout: Duration,
-    read_timeout: Duration,
     max_request_body_bytes: u64,
     max_response_body_bytes: u64,
 }
@@ -43,6 +43,8 @@ pub enum UpstreamError {
     InvalidBackendUrl(String),
     InvalidUri(hyper::http::uri::InvalidUri),
     ConnectTimeout(Duration),
+    ConnectionRefused(hyper_util::client::legacy::Error),
+    InvalidResponse(hyper_util::client::legacy::Error),
     Request(hyper_util::client::legacy::Error),
     ResponseTooLarge { limit: u64, content_length: u64 },
 }
@@ -53,6 +55,8 @@ impl UpstreamError {
             Self::InvalidBackendUrl(_) => "invalid_backend_url",
             Self::InvalidUri(_) => "invalid_upstream_uri",
             Self::ConnectTimeout(_) => "upstream_connect_timeout",
+            Self::ConnectionRefused(_) => "upstream_connection_refused",
+            Self::InvalidResponse(_) => "invalid_upstream_response",
             Self::Request(_) => "upstream_request_failed",
             Self::ResponseTooLarge { .. } => "response_body_too_large",
         }
@@ -67,10 +71,12 @@ impl std::fmt::Display for UpstreamError {
             Self::ConnectTimeout(duration) => {
                 write!(
                     f,
-                    "upstream connect/read-header timeout after {} ms",
+                    "upstream connect or response-header timeout after {} ms",
                     duration.as_millis()
                 )
             }
+            Self::ConnectionRefused(_) => write!(f, "upstream connection refused"),
+            Self::InvalidResponse(_) => write!(f, "upstream sent an invalid HTTP response"),
             Self::Request(err) => write!(f, "upstream request failed: {err}"),
             Self::ResponseTooLarge {
                 limit,
@@ -91,13 +97,10 @@ impl UpstreamClient {
     pub fn new(config: &UpstreamConfig) -> Self {
         let mut connector = HttpConnector::new();
         let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
-        let read_timeout = Duration::from_millis(config.read_timeout_ms);
         connector.set_connect_timeout(Some(connect_timeout));
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
             client,
-            connect_timeout,
-            read_timeout,
             max_request_body_bytes: config.max_request_body_bytes,
             max_response_body_bytes: config.max_response_body_bytes,
         }
@@ -112,7 +115,11 @@ impl UpstreamClient {
         backend: &str,
         request: Request<B>,
         client_addr: Option<SocketAddr>,
+        connect_timeout: Duration,
+        read_timeout: Duration,
         client_body_timeout: Duration,
+        request_error_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
+        response_error_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     ) -> Result<Response<ProxyBody>, UpstreamError>
     where
         B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
@@ -140,14 +147,15 @@ impl UpstreamClient {
                 self.max_request_body_bytes,
                 client_body_timeout,
                 "client request body",
+                request_error_hook,
             ))
             .expect("invalid upstream request");
 
         let upstream_response =
-            timeout(self.connect_timeout, self.client.request(upstream_request))
+            timeout(connect_timeout, self.client.request(upstream_request))
                 .await
-                .map_err(|_| UpstreamError::ConnectTimeout(self.connect_timeout))?
-                .map_err(UpstreamError::Request)?;
+                .map_err(|_| UpstreamError::ConnectTimeout(connect_timeout))?
+                .map_err(classify_request_error)?;
 
         let (parts, body): (_, Incoming) = upstream_response.into_parts();
         if let Some(content_length) =
@@ -172,8 +180,9 @@ impl UpstreamClient {
             .body(limit_body_stream(
                 body,
                 self.max_response_body_bytes,
-                self.read_timeout,
+                read_timeout,
                 "upstream response body",
+                response_error_hook,
             ))
             .expect("invalid upstream response"))
     }
@@ -186,8 +195,12 @@ impl Default for UpstreamClient {
 }
 
 pub fn bad_gateway_response(err: &UpstreamError) -> Response<ProxyBody> {
+    let status = match err {
+        UpstreamError::ConnectTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::BAD_GATEWAY,
+    };
     Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
+        .status(status)
         .body(full_body(format!("bad gateway: {err}\n")))
         .expect("invalid bad gateway response")
 }
@@ -203,6 +216,47 @@ fn build_upstream_uri(backend: &Url, request_uri: &Uri) -> Result<Uri, UpstreamE
     url.set_path(request_uri.path());
     url.set_query(request_uri.query());
     url.as_str().parse().map_err(UpstreamError::InvalidUri)
+}
+
+fn classify_request_error(err: hyper_util::client::legacy::Error) -> UpstreamError {
+    if err.is_connect() && source_has_io_kind(&err, std::io::ErrorKind::ConnectionRefused) {
+        return UpstreamError::ConnectionRefused(err);
+    }
+
+    if !err.is_connect() || source_has_invalid_response(&err) {
+        return UpstreamError::InvalidResponse(err);
+    }
+
+    UpstreamError::Request(err)
+}
+
+fn source_has_io_kind(
+    err: &(dyn StdError + 'static),
+    expected: std::io::ErrorKind,
+) -> bool {
+    let mut current = Some(err);
+    while let Some(source) = current {
+        if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == expected {
+                return true;
+            }
+        }
+        current = source.source();
+    }
+    false
+}
+
+fn source_has_invalid_response(err: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(source) = current {
+        if let Some(hyper_err) = source.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_parse() || hyper_err.is_incomplete_message() {
+                return true;
+            }
+        }
+        current = source.source();
+    }
+    false
 }
 
 fn apply_forwarding_headers(
@@ -282,6 +336,7 @@ fn limit_body_stream<B>(
     max_bytes: u64,
     idle_timeout: Duration,
     context: &'static str,
+    error_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
 ) -> ProxyBody
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
@@ -295,13 +350,20 @@ where
             Ok(Ok(bytes)) => {
                 seen += bytes.len() as u64;
                 if seen > max_bytes {
+                    notify_error(&error_hook, size_limit_kind(context));
                     Err(size_limit_error(max_bytes, context))
                 } else {
                     Ok(Frame::data(bytes))
                 }
             }
-            Ok(Err(err)) => Err(Box::new(err) as ProxyError),
-            Err(_) => Err(timeout_error(idle_timeout, context)),
+            Ok(Err(err)) => {
+                notify_error(&error_hook, read_failure_kind(context));
+                Err(Box::new(err) as ProxyError)
+            }
+            Err(_) => {
+                notify_error(&error_hook, timeout_kind(context));
+                Err(timeout_error(idle_timeout, context))
+            }
         });
 
     StreamBody::new(stream).boxed_unsync()
@@ -322,6 +384,39 @@ fn size_limit_error(limit: u64, context: &str) -> ProxyError {
         std::io::ErrorKind::InvalidData,
         format!("{context} exceeded {limit} byte limit"),
     ))
+}
+
+fn notify_error(
+    hook: &Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
+    kind: &'static str,
+) {
+    if let Some(hook) = hook {
+        hook(kind);
+    }
+}
+
+fn timeout_kind(context: &str) -> &'static str {
+    match context {
+        "client request body" => "client_body_timeout",
+        "upstream response body" => "upstream_response_body_timeout",
+        _ => "stream_timeout",
+    }
+}
+
+fn read_failure_kind(context: &str) -> &'static str {
+    match context {
+        "client request body" => "client_request_body_read_failed",
+        "upstream response body" => "upstream_response_body_read_failed",
+        _ => "stream_read_failed",
+    }
+}
+
+fn size_limit_kind(context: &str) -> &'static str {
+    match context {
+        "client request body" => "request_body_too_large",
+        "upstream response body" => "response_body_too_large",
+        _ => "stream_too_large",
+    }
 }
 
 fn format_forwarded_for(value: &str) -> String {
@@ -412,13 +507,73 @@ mod tests {
             .unwrap();
 
         let err = client
-            .forward(backend.as_str(), request, None, Duration::from_millis(50))
+            .forward(
+                backend.as_str(),
+                request,
+                None,
+                Duration::from_millis(20),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains("upstream connect/read-header timeout")
+                .contains("upstream connect or response-header timeout")
         );
+    }
+
+    #[tokio::test]
+    async fn classifies_connection_refused_errors() {
+        let client = UpstreamClient::new(&UpstreamConfig::default());
+        let request = Request::builder()
+            .uri("/api/users")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let err = client
+            .forward(
+                "http://127.0.0.1:9",
+                request,
+                None,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), "upstream_connection_refused");
+    }
+
+    #[tokio::test]
+    async fn classifies_invalid_upstream_responses() {
+        let backend = spawn_invalid_response_server().await;
+        let client = UpstreamClient::new(&UpstreamConfig::default());
+        let request = Request::builder()
+            .uri("/api/users")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let err = client
+            .forward(
+                backend.as_str(),
+                request,
+                None,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), "invalid_upstream_response");
     }
 
     #[tokio::test]
@@ -435,7 +590,16 @@ mod tests {
             .unwrap();
 
         let response = client
-            .forward(backend.as_str(), request, None, Duration::from_millis(50))
+            .forward(
+                backend.as_str(),
+                request,
+                None,
+                Duration::from_millis(100),
+                Duration::from_millis(20),
+                Duration::from_millis(50),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let err = response.into_body().collect().await.unwrap_err();
@@ -457,7 +621,16 @@ mod tests {
             .unwrap();
 
         let err = client
-            .forward(backend.as_str(), request, None, Duration::from_millis(50))
+            .forward(
+                backend.as_str(),
+                request,
+                None,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "response_body_too_large");
@@ -476,7 +649,16 @@ mod tests {
             .unwrap();
 
         let response = client
-            .forward(backend.as_str(), request, None, Duration::from_millis(50))
+            .forward(
+                backend.as_str(),
+                request,
+                None,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let err = response.into_body().collect().await.unwrap_err();
@@ -557,6 +739,21 @@ mod tests {
             http1::Builder::new()
                 .serve_connection(io, service)
                 .await
+                .unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn spawn_invalid_response_server() -> String {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = std_listener.accept().unwrap();
+            use std::io::Write;
+            stream
+                .write_all(b"HTTP/1.1 20X Broken\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
 

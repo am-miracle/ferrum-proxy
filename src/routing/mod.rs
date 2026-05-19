@@ -12,7 +12,7 @@ pub fn match_route<'a>(path: &str, routes: &'a [RouteConfig]) -> Option<&'a Rout
 
 #[cfg(test)]
 mod tests {
-    use crate::config::RouteConfig;
+    use crate::config::{BalancingStrategy, RouteConfig};
 
     use super::match_route;
 
@@ -22,10 +22,24 @@ mod tests {
             RouteConfig {
                 path_prefix: "/api".to_string(),
                 backends: vec!["http://127.0.0.1:3001".to_string()],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
             },
             RouteConfig {
                 path_prefix: "/api/admin".to_string(),
                 backends: vec!["http://127.0.0.1:4001".to_string()],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
             },
         ];
 
@@ -38,6 +52,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
 
         assert!(match_route("/api-other/resource", &routes).is_none());
@@ -48,6 +69,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
 
         assert!(match_route("/api", &routes).is_some());
@@ -58,6 +86,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
 
         assert!(match_route("/static/logo.png", &routes).is_none());

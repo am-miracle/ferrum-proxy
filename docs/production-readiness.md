@@ -51,19 +51,19 @@ these are the main reliability and operational gaps after the first set of block
 these items improve correctness and behavior under real-world traffic and failure conditions.
 
 - audit HTTP semantics.
-  verify behavior for large uploads, chunked bodies, client disconnects, upstream disconnects, and streaming cancellation.
+  large uploads, chunked request limits, upstream header stalls, upstream body stalls, partial client disconnects during request buffering, and client disconnects during streamed responses are covered now. upstream disconnects mid-stream still need deeper end-to-end verification. if HTTP/2 downstream support is added later, re-audit h1-upstream to h2-downstream response header forwarding for retained shared header buffers instead of only logical leaks.
 
 - support TLS properly.
-  either terminate TLS in this service or make it an explicit deployment requirement that a trusted front proxy does it.
+  `https://` upstreams are now rejected explicitly. production still needs either real TLS support in this service or a documented deployment requirement that a trusted front proxy terminates TLS and forwards plain HTTP.
 
 - add per-route policy.
-  Different routes may need different timeouts, health endpoints, retry settings, or balancing strategies.
+  route-level retry and passive failure status overrides exist now, along with route-specific connect/read/body timeouts, health endpoints, and balancing strategies. what remains is deciding how far route policy should go beyond those basics, for example per-route health thresholds or richer balancing behavior.
 
 - improve response classification.
-  decide exactly which upstream statuses should count as passive failures. Production rules are usually more nuanced than "all `5xx`".
+  passive failure classification is no longer limited to one global `5xx` range. routes can now override which upstream statuses count as passive failures, but production rules may still need more protocol-specific nuance.
 
 - add stronger error mapping.
-  distinguish connect timeout, read timeout, refused connection, invalid upstream response, and no healthy backends in logs and metrics.
+  connect or response-header timeout, refused connection, invalid upstream response, oversized upstream response, no healthy backends, client request body timeout, client request body read failure, and upstream response body timeout now surface as separate proxy error kinds. upstream disconnects mid-stream could still use more explicit reporting.
 
 ## tier 4
 

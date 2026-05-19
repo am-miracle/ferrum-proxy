@@ -402,7 +402,7 @@ fn quote(value: &str) -> String {
 mod tests {
     use std::time::Duration;
 
-    use crate::config::RouteConfig;
+    use crate::config::{BalancingStrategy, RouteConfig};
 
     use super::Telemetry;
 
@@ -411,6 +411,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let telemetry = Telemetry::new(&routes);
 

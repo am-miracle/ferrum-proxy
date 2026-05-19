@@ -1,42 +1,64 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::RouteConfig;
+use crate::config::{BalancingStrategy, RouteConfig};
 
-pub struct RoundRobinBalancer {
-    counters: HashMap<String, AtomicUsize>,
+pub struct LoadBalancer {
+    routes: HashMap<String, RouteBalancer>,
 }
 
-impl RoundRobinBalancer {
+struct RouteBalancer {
+    strategy: BalancingStrategy,
+    counter: AtomicU64,
+}
+
+impl LoadBalancer {
     pub fn new(routes: &[RouteConfig]) -> Self {
-        let counters = routes
+        let routes = routes
             .iter()
-            .map(|route| (route.path_prefix.clone(), AtomicUsize::new(0)))
+            .map(|route| {
+                (
+                    route.path_prefix.clone(),
+                    RouteBalancer {
+                        strategy: route.balancing,
+                        counter: AtomicU64::new(0),
+                    },
+                )
+            })
             .collect();
 
-        Self { counters }
+        Self { routes }
     }
 
-    pub fn select_backend<'a>(&self, route_key: &str, backends: &'a [&'a str]) -> Option<&'a str> {
+    pub fn select_backend<'a>(&self, route: &RouteConfig, backends: &'a [&'a str]) -> Option<&'a str> {
         if backends.is_empty() {
             return None;
         }
 
-        let index = self
-            .counters
-            .get(route_key)
-            .map(|counter| counter.fetch_add(1, Ordering::Relaxed) % backends.len())
-            .unwrap_or(0); // unknown prefix, fall back to first backend
+        match self.routes.get(route.path_prefix.as_str()) {
+            Some(route_balancer) => route_balancer.select(backends),
+            None => backends.first().copied(),
+        }
+    }
+}
 
-        backends.get(index).copied()
+impl RouteBalancer {
+    fn select<'a>(&self, backends: &'a [&'a str]) -> Option<&'a str> {
+        match self.strategy {
+            BalancingStrategy::RoundRobin => {
+                let index = self.counter.fetch_add(1, Ordering::Relaxed) as usize % backends.len();
+                backends.get(index).copied()
+            }
+            BalancingStrategy::FirstHealthy => backends.first().copied(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::config::RouteConfig;
+    use crate::config::{BalancingStrategy, RouteConfig};
 
-    use super::RoundRobinBalancer;
+    use super::LoadBalancer;
 
     #[test]
     fn cycles_backends_in_round_robin_order() {
@@ -47,28 +69,64 @@ mod tests {
                 "http://127.0.0.1:3002".to_string(),
                 "http://127.0.0.1:3003".to_string(),
             ],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         };
         let backends = [
             "http://127.0.0.1:3001",
             "http://127.0.0.1:3002",
             "http://127.0.0.1:3003",
         ];
-        let balancer = RoundRobinBalancer::new(&[route]);
+        let balancer = LoadBalancer::new(&[route.clone()]);
 
         assert_eq!(
-            balancer.select_backend("/api", &backends),
+            balancer.select_backend(&route, &backends),
             Some("http://127.0.0.1:3001")
         );
         assert_eq!(
-            balancer.select_backend("/api", &backends),
+            balancer.select_backend(&route, &backends),
             Some("http://127.0.0.1:3002")
         );
         assert_eq!(
-            balancer.select_backend("/api", &backends),
+            balancer.select_backend(&route, &backends),
             Some("http://127.0.0.1:3003")
         );
         assert_eq!(
-            balancer.select_backend("/api", &backends),
+            balancer.select_backend(&route, &backends),
+            Some("http://127.0.0.1:3001")
+        );
+    }
+
+    #[test]
+    fn first_healthy_strategy_picks_first_backend_without_rotation() {
+        let route = RouteConfig {
+            path_prefix: "/api".to_string(),
+            backends: vec![
+                "http://127.0.0.1:3001".to_string(),
+                "http://127.0.0.1:3002".to_string(),
+            ],
+            balancing: BalancingStrategy::FirstHealthy,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
+        };
+        let backends = ["http://127.0.0.1:3001", "http://127.0.0.1:3002"];
+        let balancer = LoadBalancer::new(&[route.clone()]);
+
+        assert_eq!(
+            balancer.select_backend(&route, &backends),
+            Some("http://127.0.0.1:3001")
+        );
+        assert_eq!(
+            balancer.select_backend(&route, &backends),
             Some("http://127.0.0.1:3001")
         );
     }
@@ -78,9 +136,16 @@ mod tests {
         let route = RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         };
-        let balancer = RoundRobinBalancer::new(&[route]);
+        let balancer = LoadBalancer::new(&[route.clone()]);
 
-        assert_eq!(balancer.select_backend("/api", &[]), None);
+        assert_eq!(balancer.select_backend(&route, &[]), None);
     }
 }

@@ -286,11 +286,11 @@ async fn run_active_check_pass_with_client(
     manager: &HealthManager,
     check_timeout: Duration,
 ) {
-    for backend in unique_backends(&config.routes) {
+    for (backend, endpoint) in unique_backend_checks(config) {
         let check_backend_status = check_backend(
             client,
             backend.as_str(),
-            &config.health_check.endpoint,
+            endpoint.as_str(),
             check_timeout,
         )
         .await;
@@ -337,17 +337,22 @@ fn build_healthcheck_uri(backend: &str, endpoint: &str) -> Result<Uri, url::Pars
     Ok(url.as_str().parse().expect("invalid health check URI"))
 }
 
-// a backend may appear in multiple routes; check it once per cycle
-fn unique_backends(routes: &[RouteConfig]) -> Vec<String> {
-    let mut backends = HashSet::new();
+// a backend may appear in multiple routes; check each unique backend+endpoint pair once per cycle.
+fn unique_backend_checks(config: &Config) -> Vec<(String, String)> {
+    let mut checks = HashSet::new();
 
-    for route in routes {
+    for route in &config.routes {
+        let endpoint = route
+            .health_check_endpoint
+            .as_deref()
+            .unwrap_or(config.health_check.endpoint.as_str())
+            .to_string();
         for backend in &route.backends {
-            backends.insert(backend.clone());
+            checks.insert((backend.clone(), endpoint.clone()));
         }
     }
 
-    backends.into_iter().collect()
+    checks.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -362,7 +367,7 @@ mod tests {
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::time::Duration;
 
-    use crate::config::{Config, HealthCheckConfig, RouteConfig, ServerConfig};
+    use crate::config::{BalancingStrategy, Config, HealthCheckConfig, RouteConfig, ServerConfig};
 
     use super::{HealthManager, build_healthcheck_uri, run_active_check_pass};
 
@@ -374,6 +379,13 @@ mod tests {
                 "http://127.0.0.1:3001".to_string(),
                 "http://127.0.0.1:3002".to_string(),
             ],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::new(&routes);
 
@@ -390,6 +402,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::new(&routes);
 
@@ -404,6 +423,13 @@ mod tests {
                 "http://127.0.0.1:3002".to_string(),
                 "http://127.0.0.1:3001".to_string(),
             ],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::new(&routes);
 
@@ -425,6 +451,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::new(&routes);
 
@@ -443,6 +476,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::new(&routes);
 
@@ -461,6 +501,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::with_telemetry(
             &routes,
@@ -496,6 +543,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::with_telemetry(
             &routes,
@@ -531,6 +585,13 @@ mod tests {
         let routes = vec![RouteConfig {
             path_prefix: "/api".to_string(),
             backends: vec!["http://127.0.0.1:3001".to_string()],
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+            passive_failure_statuses: vec![],
+            health_check_endpoint: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            client_body_timeout_ms: None,
         }];
         let manager = HealthManager::with_telemetry(
             &routes,
@@ -592,6 +653,51 @@ mod tests {
         assert!(manager.is_backend_healthy(&backend));
     }
 
+    #[tokio::test]
+    async fn route_specific_health_endpoint_override_is_used_for_active_checks() {
+        let backend = spawn_dual_health_server().await;
+        let config = Config {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                ..Default::default()
+            },
+            routes: vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                backends: vec![backend.clone()],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: Some("/ready".to_string()),
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
+            }],
+            health_check: HealthCheckConfig {
+                interval_sec: 1,
+                endpoint: "/health".to_string(),
+                ..Default::default()
+            },
+            upstream: crate::config::UpstreamConfig::default(),
+            retry: crate::config::RetryConfig::default(),
+            debug: crate::config::DebugConfig::default(),
+        };
+        let manager = HealthManager::with_telemetry(
+            &config.routes,
+            1,
+            1,
+            Duration::from_millis(30),
+            200,
+            399,
+            500,
+            599,
+            None,
+        );
+
+        run_active_check_pass(&config, &manager).await;
+        assert!(manager.is_backend_healthy(&backend));
+    }
+
     #[test]
     fn builds_healthcheck_uri_from_backend_and_endpoint() {
         let uri = build_healthcheck_uri("http://127.0.0.1:3001", "/health").unwrap();
@@ -606,8 +712,15 @@ mod tests {
                 ..Default::default()
             },
             routes: vec![RouteConfig {
-                path_prefix: "/api".to_string(),
-                backends,
+            path_prefix: "/api".to_string(),
+            backends,
+            balancing: BalancingStrategy::RoundRobin,
+            retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
             }],
             health_check: HealthCheckConfig {
                 interval_sec: 1,
@@ -643,6 +756,42 @@ mod tests {
 
                             Ok::<_, std::convert::Infallible>(response)
                         }
+                    });
+
+                    http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn spawn_dual_health_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<hyper::body::Incoming>| async move {
+                        let status = if request.uri().path() == "/ready" {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+
+                        let response = Response::builder()
+                            .status(status)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap();
+
+                        Ok::<_, std::convert::Infallible>(response)
                     });
 
                     http1::Builder::new()

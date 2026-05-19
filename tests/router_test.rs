@@ -1,4 +1,6 @@
-use ferrum_proxy::config::{Config, HealthCheckConfig, RouteConfig, ServerConfig, UpstreamConfig};
+use ferrum_proxy::config::{
+    BalancingStrategy, Config, HealthCheckConfig, RouteConfig, ServerConfig, UpstreamConfig,
+};
 use ferrum_proxy::http::{AppState, handle_request};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
@@ -30,6 +32,13 @@ fn route(path_prefix: &str, backends: &[String]) -> RouteConfig {
     RouteConfig {
         path_prefix: path_prefix.to_string(),
         backends: backends.to_vec(),
+        balancing: BalancingStrategy::RoundRobin,
+        retry_on_statuses: vec![],
+        passive_failure_statuses: vec![],
+        health_check_endpoint: None,
+        connect_timeout_ms: None,
+        read_timeout_ms: None,
+        client_body_timeout_ms: None,
     }
 }
 

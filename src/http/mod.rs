@@ -18,7 +18,7 @@ fn next_request_id() -> String {
     format!("{id:016x}")
 }
 
-use crate::balancing::RoundRobinBalancer;
+use crate::balancing::LoadBalancer;
 use crate::config::{Config, RouteConfig};
 use crate::health::{HealthManager, run_active_check_pass, spawn_active_checks};
 use crate::routing::match_route;
@@ -27,7 +27,7 @@ use crate::telemetry::Telemetry;
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<Config>,
-    balancer: Arc<RoundRobinBalancer>,
+    balancer: Arc<LoadBalancer>,
     health: Arc<HealthManager>,
     telemetry: Arc<Telemetry>,
     upstream: UpstreamClient,
@@ -44,7 +44,7 @@ impl AppState {
         let upstream_config = config.upstream.clone();
         let max_buffered_bodies = config.upstream.max_buffered_bodies;
         let telemetry = Arc::new(Telemetry::new(&config.routes));
-        let balancer = Arc::new(RoundRobinBalancer::new(&config.routes));
+        let balancer = Arc::new(LoadBalancer::new(&config.routes));
         let health = Arc::new(HealthManager::with_telemetry(
             &config.routes,
             config.health_check.failure_threshold,
@@ -93,11 +93,45 @@ impl AppState {
         Duration::from_millis(self.config.server.client_header_timeout_ms)
     }
 
-    pub fn should_retry_status(&self, status: StatusCode) -> bool {
-        self.config
-            .retry
-            .retry_on_statuses
-            .contains(&status.as_u16())
+    pub fn route_client_body_timeout(&self, route: &RouteConfig) -> Duration {
+        Duration::from_millis(
+            route
+                .client_body_timeout_ms
+                .unwrap_or(self.config.server.client_body_timeout_ms),
+        )
+    }
+
+    pub fn route_connect_timeout(&self, route: &RouteConfig) -> Duration {
+        Duration::from_millis(
+            route
+                .connect_timeout_ms
+                .unwrap_or(self.config.upstream.connect_timeout_ms),
+        )
+    }
+
+    pub fn route_read_timeout(&self, route: &RouteConfig) -> Duration {
+        Duration::from_millis(
+            route
+                .read_timeout_ms
+                .unwrap_or(self.config.upstream.read_timeout_ms),
+        )
+    }
+
+    pub fn should_retry_status(&self, route: &RouteConfig, status: StatusCode) -> bool {
+        let retry_on_statuses = if route.retry_on_statuses.is_empty() {
+            &self.config.retry.retry_on_statuses
+        } else {
+            &route.retry_on_statuses
+        };
+        retry_on_statuses.contains(&status.as_u16())
+    }
+
+    pub fn is_passive_failure_status(&self, route: &RouteConfig, status: StatusCode) -> bool {
+        if !route.passive_failure_statuses.is_empty() {
+            return route.passive_failure_statuses.contains(&status.as_u16());
+        }
+
+        self.health.is_passive_failure_status(status)
     }
 
     pub async fn run_startup_health_check(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -197,7 +231,7 @@ where
         .map(|info| info.remote_addr);
     let started = Instant::now();
 
-    let client_body_timeout = Duration::from_millis(state.config.server.client_body_timeout_ms);
+    let client_body_timeout = state.route_client_body_timeout(route);
     if should_retry_request(&state, &method) {
         let _permit = match state.buffer_semaphore.try_acquire() {
             Ok(permit) => permit,
@@ -297,6 +331,7 @@ where
                     &state,
                     &method,
                     &path,
+                    route,
                     backend.as_str(),
                     buffered.map(Full::new),
                     client_addr,
@@ -331,6 +366,7 @@ where
             &state,
             &method,
             &path,
+            route,
             backend.as_str(),
             request,
             client_addr,
@@ -407,6 +443,7 @@ async fn forward_with_retries(
             state,
             method,
             path,
+            route,
             backend.as_str(),
             replayable.to_request(),
             client_addr,
@@ -417,7 +454,7 @@ async fn forward_with_retries(
         .await;
 
         let status = response.status();
-        if !should_retry_response(state, status)
+        if !should_retry_response(state, route, status)
             || attempt >= max_attempts
             || started.elapsed() >= total_timeout
         {
@@ -452,6 +489,7 @@ async fn forward_request<B>(
     state: &AppState,
     method: &Method,
     path: &str,
+    route: &RouteConfig,
     backend: &str,
     request: Request<B>,
     client_addr: Option<SocketAddr>,
@@ -463,14 +501,37 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    let request_error_hook: Arc<dyn Fn(&'static str) + Send + Sync> = {
+        let telemetry = state.telemetry_handle();
+        Arc::new(move |kind| telemetry.record_proxy_error(kind))
+    };
+    let response_error_hook: Arc<dyn Fn(&'static str) + Send + Sync> = {
+        let telemetry = state.telemetry_handle();
+        let health = state.health.clone();
+        let backend = backend.to_string();
+        Arc::new(move |kind| {
+            telemetry.record_proxy_error(kind);
+            health.record_failure(backend.as_str());
+        })
+    };
+
     match state
         .upstream
-        .forward(backend, request, client_addr, client_body_timeout)
+        .forward(
+            backend,
+            request,
+            client_addr,
+            state.route_connect_timeout(route),
+            state.route_read_timeout(route),
+            client_body_timeout,
+            Some(request_error_hook),
+            Some(response_error_hook),
+        )
         .await
     {
         Ok(response) => {
             state.telemetry.record_upstream_latency(started.elapsed());
-            if state.health.is_passive_failure_status(response.status()) {
+            if state.is_passive_failure_status(route, response.status()) {
                 state.health.record_failure(backend);
             } else {
                 state.health.record_success(backend);
@@ -560,7 +621,7 @@ impl RequestBufferError {
         match self {
             Self::TooLarge { .. } => "request_body_too_large",
             Self::TimedOut { .. } => "client_body_timeout",
-            Self::ReadFailed(_) => "request_body_read_failed",
+            Self::ReadFailed(_) => "client_request_body_read_failed",
         }
     }
 
@@ -782,7 +843,7 @@ fn select_backend<'a>(
 
     state
         .balancer
-        .select_backend(&route.path_prefix, &eligible)
+        .select_backend(route, &eligible)
         .map(str::to_string)
 }
 
@@ -801,8 +862,8 @@ fn is_retryable_method(method: &Method, retry_idempotent: bool) -> bool {
     ) || (retry_idempotent && matches!(*method, Method::PUT | Method::DELETE))
 }
 
-fn should_retry_response(state: &AppState, status: StatusCode) -> bool {
-    state.should_retry_status(status)
+fn should_retry_response(state: &AppState, route: &RouteConfig, status: StatusCode) -> bool {
+    state.should_retry_status(route, status)
 }
 
 fn debug_request_authorized(request: &Request<impl hyper::body::Body>, state: &AppState) -> bool {
@@ -841,7 +902,9 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::{AppState, ConnectionInfo, handle_request, should_prebuffer_request};
-    use crate::config::{Config, HealthCheckConfig, RouteConfig, ServerConfig, UpstreamConfig};
+    use crate::config::{
+        BalancingStrategy, Config, HealthCheckConfig, RouteConfig, ServerConfig, UpstreamConfig,
+    };
 
     fn sample_state() -> AppState {
         AppState::new(sample_config())
@@ -861,10 +924,24 @@ mod tests {
                         "http://127.0.0.1:3001".to_string(),
                         "http://127.0.0.1:3002".to_string(),
                     ],
+                    balancing: BalancingStrategy::RoundRobin,
+                    retry_on_statuses: vec![],
+                    passive_failure_statuses: vec![],
+                    health_check_endpoint: None,
+                    connect_timeout_ms: None,
+                    read_timeout_ms: None,
+                    client_body_timeout_ms: None,
                 },
                 RouteConfig {
                     path_prefix: "/static".to_string(),
                     backends: vec!["http://127.0.0.1:4000".to_string()],
+                    balancing: BalancingStrategy::RoundRobin,
+                    retry_on_statuses: vec![],
+                    passive_failure_statuses: vec![],
+                    health_check_endpoint: None,
+                    connect_timeout_ms: None,
+                    read_timeout_ms: None,
+                    client_body_timeout_ms: None,
                 },
             ],
             health_check: HealthCheckConfig {
@@ -1072,6 +1149,13 @@ mod tests {
             routes: vec![RouteConfig {
                 path_prefix: "/api".to_string(),
                 backends: vec![upstream],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
             }],
             upstream: UpstreamConfig {
                 max_request_body_bytes: 4,
@@ -1123,6 +1207,13 @@ mod tests {
             routes: vec![RouteConfig {
                 path_prefix: "/api".to_string(),
                 backends: vec![upstream],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
             }],
             upstream: UpstreamConfig {
                 max_response_body_bytes: 4,
@@ -1165,6 +1256,13 @@ mod tests {
             routes: vec![RouteConfig {
                 path_prefix: "/api".to_string(),
                 backends: vec![first, second],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
             }],
             retry: crate::config::RetryConfig {
                 max_attempts: 2,
@@ -1219,6 +1317,13 @@ mod tests {
             routes: vec![RouteConfig {
                 path_prefix: "/api".to_string(),
                 backends: vec![first, second],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
             }],
             retry: crate::config::RetryConfig {
                 max_attempts: 2,
@@ -1240,6 +1345,139 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(seen_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn route_specific_retry_statuses_override_global_retry_policy() {
+        let first = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Full::new(Bytes::from_static(b"retry me")))
+                .unwrap()
+        })
+        .await;
+        let second = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from_static(b"healthy-backend")))
+                .unwrap()
+        })
+        .await;
+
+        let state = state_with_config(Config {
+            routes: vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                backends: vec![first, second],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![502],
+                passive_failure_statuses: vec![],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
+            }],
+            retry: crate::config::RetryConfig {
+                max_attempts: 2,
+                retry_on_statuses: vec![503],
+                ..Default::default()
+            },
+            ..sample_config()
+        });
+
+        let response = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state,
+        )
+        .await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, Bytes::from_static(b"healthy-backend"));
+    }
+
+    #[tokio::test]
+    async fn route_specific_passive_failure_statuses_override_global_health_policy() {
+        let first = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(Full::new(Bytes::from_static(b"rate-limited")))
+                .unwrap()
+        })
+        .await;
+        let second = spawn_test_upstream(|_| async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from_static(b"healthy-backend")))
+                .unwrap()
+        })
+        .await;
+
+        let state = state_with_config(Config {
+            health_check: HealthCheckConfig {
+                failure_threshold: 2,
+                ..sample_config().health_check
+            },
+            routes: vec![RouteConfig {
+                path_prefix: "/api".to_string(),
+                backends: vec![first, second],
+                balancing: BalancingStrategy::RoundRobin,
+                retry_on_statuses: vec![],
+                passive_failure_statuses: vec![429],
+                health_check_endpoint: None,
+                connect_timeout_ms: None,
+                read_timeout_ms: None,
+                client_body_timeout_ms: None,
+            }],
+            ..sample_config()
+        });
+
+        let first = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        let second = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        let third = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state.clone(),
+        )
+        .await;
+        let fourth = handle_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/users")
+                .body(empty_body())
+                .unwrap(),
+            state,
+        )
+        .await;
+
+        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = fourth.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"healthy-backend"));
     }
 
     #[tokio::test]
@@ -1308,10 +1546,24 @@ mod tests {
                         .iter()
                         .map(|backend| (*backend).to_string())
                         .collect(),
+                    balancing: BalancingStrategy::RoundRobin,
+                    retry_on_statuses: vec![],
+                    passive_failure_statuses: vec![],
+                    health_check_endpoint: None,
+                    connect_timeout_ms: None,
+                    read_timeout_ms: None,
+                    client_body_timeout_ms: None,
                 },
                 RouteConfig {
                     path_prefix: "/static".to_string(),
                     backends: vec!["http://127.0.0.1:4000".to_string()],
+                    balancing: BalancingStrategy::RoundRobin,
+                    retry_on_statuses: vec![],
+                    passive_failure_statuses: vec![],
+                    health_check_endpoint: None,
+                    connect_timeout_ms: None,
+                    read_timeout_ms: None,
+                    client_body_timeout_ms: None,
                 },
             ],
             health_check: HealthCheckConfig {

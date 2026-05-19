@@ -38,6 +38,28 @@ pub struct ServerConfig {
 pub struct RouteConfig {
     pub path_prefix: String,
     pub backends: Vec<String>,
+    #[serde(default)]
+    pub balancing: BalancingStrategy,
+    #[serde(default)]
+    pub retry_on_statuses: Vec<u16>,
+    #[serde(default)]
+    pub passive_failure_statuses: Vec<u16>,
+    #[serde(default)]
+    pub health_check_endpoint: Option<String>,
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub read_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub client_body_timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BalancingStrategy {
+    #[default]
+    RoundRobin,
+    FirstHealthy,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -168,6 +190,30 @@ impl Config {
         self.upstream.validate()?;
         self.retry.validate()?;
         self.debug.validate()?;
+        self.validate_route_health_endpoint_overrides()?;
+
+        Ok(())
+    }
+
+    fn validate_route_health_endpoint_overrides(&self) -> Result<(), ConfigError> {
+        let mut endpoint_by_backend = std::collections::HashMap::new();
+
+        for route in &self.routes {
+            let endpoint = route
+                .health_check_endpoint
+                .as_deref()
+                .unwrap_or(self.health_check.endpoint.as_str());
+            for backend in &route.backends {
+                if let Some(previous) = endpoint_by_backend.insert(backend.as_str(), endpoint) {
+                    if previous != endpoint {
+                        return Err(ConfigError::Validation(format!(
+                            "backend '{}' is used by multiple routes with conflicting health check endpoints ('{}' vs '{}')",
+                            backend, previous, endpoint
+                        )));
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -234,6 +280,60 @@ impl RouteConfig {
             )));
         }
 
+        for status in &self.retry_on_statuses {
+            if *status < 100 {
+                return Err(ConfigError::Validation(format!(
+                    "route '{}' retry_on_statuses contains invalid status code '{}'",
+                    self.path_prefix, status
+                )));
+            }
+        }
+
+        for status in &self.passive_failure_statuses {
+            if *status < 100 {
+                return Err(ConfigError::Validation(format!(
+                    "route '{}' passive_failure_statuses contains invalid status code '{}'",
+                    self.path_prefix, status
+                )));
+            }
+        }
+
+        if let Some(endpoint) = &self.health_check_endpoint {
+            if !endpoint.starts_with('/') {
+                return Err(ConfigError::Validation(format!(
+                    "route '{}' health_check_endpoint must start with '/'",
+                    self.path_prefix
+                )));
+            }
+        }
+
+        if let Some(timeout) = self.connect_timeout_ms {
+            if timeout == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "route '{}' connect_timeout_ms must be greater than 0",
+                    self.path_prefix
+                )));
+            }
+        }
+
+        if let Some(timeout) = self.read_timeout_ms {
+            if timeout == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "route '{}' read_timeout_ms must be greater than 0",
+                    self.path_prefix
+                )));
+            }
+        }
+
+        if let Some(timeout) = self.client_body_timeout_ms {
+            if timeout == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "route '{}' client_body_timeout_ms must be greater than 0",
+                    self.path_prefix
+                )));
+            }
+        }
+
         for backend in &self.backends {
             let parsed = Url::parse(backend).map_err(|err| {
                 ConfigError::Validation(format!(
@@ -243,7 +343,13 @@ impl RouteConfig {
             })?;
 
             match parsed.scheme() {
-                "http" | "https" => {}
+                "http" => {}
+                "https" => {
+                    return Err(ConfigError::Validation(format!(
+                        "route '{}' backend '{}' uses https, but ferrum-proxy does not terminate or originate TLS yet; place it behind a trusted TLS-terminating proxy or use plain http upstreams",
+                        self.path_prefix, backend
+                    )));
+                }
                 scheme => {
                     return Err(ConfigError::Validation(format!(
                         "route '{}' uses unsupported backend scheme '{}' in '{}'",
@@ -623,6 +729,27 @@ health_check:
     }
 
     #[test]
+    fn rejects_https_backends_until_tls_support_exists() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 0.0.0.0
+routes:
+  - path_prefix: /api
+    backends:
+      - https://example.com
+health_check:
+  interval_sec: 10
+  endpoint: /health
+"#,
+        );
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("does not terminate or originate TLS yet"));
+    }
+
+    #[test]
     fn rejects_invalid_health_endpoint() {
         let config = parse_config(
             r#"
@@ -640,6 +767,32 @@ health_check:
         );
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_conflicting_route_health_endpoint_overrides_for_same_backend() {
+        let config = parse_config(
+            r#"
+server:
+  port: 8080
+  host: 0.0.0.0
+routes:
+  - path_prefix: /api
+    backends:
+      - http://127.0.0.1:3001
+    health_check_endpoint: /ready
+  - path_prefix: /admin
+    backends:
+      - http://127.0.0.1:3001
+    health_check_endpoint: /healthz
+health_check:
+  interval_sec: 10
+  endpoint: /health
+"#,
+        );
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("conflicting health check endpoints"));
     }
 
     #[test]

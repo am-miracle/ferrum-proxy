@@ -1,4 +1,6 @@
-use ferrum_proxy::config::{Config, HealthCheckConfig, RouteConfig, ServerConfig, UpstreamConfig};
+use ferrum_proxy::config::{
+    BalancingStrategy, Config, HealthCheckConfig, RouteConfig, ServerConfig, UpstreamConfig,
+};
 use ferrum_proxy::http::{AppState, handle_request};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
@@ -30,6 +32,13 @@ fn route(path_prefix: &str, backends: &[String]) -> RouteConfig {
     RouteConfig {
         path_prefix: path_prefix.to_string(),
         backends: backends.to_vec(),
+        balancing: BalancingStrategy::RoundRobin,
+        retry_on_statuses: vec![],
+        passive_failure_statuses: vec![],
+        health_check_endpoint: None,
+        connect_timeout_ms: None,
+        read_timeout_ms: None,
+        client_body_timeout_ms: None,
     }
 }
 
@@ -68,6 +77,21 @@ async fn maintains_independent_rotation_per_route() {
     assert_eq!(api_second, Bytes::from_static(b"api-b"));
     assert_eq!(static_first, Bytes::from_static(b"static-a"));
     assert_eq!(static_second, Bytes::from_static(b"static-b"));
+}
+
+#[tokio::test]
+async fn route_can_pin_to_first_healthy_backend() {
+    let first = spawn_upstream("primary", StatusCode::OK).await;
+    let second = spawn_upstream("secondary", StatusCode::OK).await;
+    let mut pinned = route("/api", &[first, second]);
+    pinned.balancing = BalancingStrategy::FirstHealthy;
+    let state = AppState::new(config(vec![pinned]));
+
+    let first_body = request_body("/api/users", state.clone()).await;
+    let second_body = request_body("/api/users", state).await;
+
+    assert_eq!(first_body, Bytes::from_static(b"primary"));
+    assert_eq!(second_body, Bytes::from_static(b"primary"));
 }
 
 #[tokio::test]

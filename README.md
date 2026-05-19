@@ -5,7 +5,7 @@
 ## What it does
 
 - path-based routing
-- round-robin load balancing
+- per-route balancing (`round_robin` or `first_healthy`)
 - active health checks
 - passive failure tracking from real traffic
 - request and response streaming
@@ -57,10 +57,18 @@ routes:
       - http://127.0.0.1:3001
       - http://127.0.0.1:3002
       - http://127.0.0.1:3003
+    balancing: round_robin
+    retry_on_statuses: [502, 503, 504]
+    passive_failure_statuses: [500, 502, 503, 504]
+    health_check_endpoint: /ready
+    connect_timeout_ms: 1000
+    read_timeout_ms: 5000
+    client_body_timeout_ms: 3000
 
   - path_prefix: /static
     backends:
       - http://127.0.0.1:4000
+    balancing: first_healthy
 
 health_check:
   interval_sec: 10
@@ -95,13 +103,16 @@ How it works:
 
 - requests starting with `/api` go to the `/api` backend pool
 - requests starting with `/static` go to the `/static` backend pool
-- the health checker probes each backend on `/health`
+- routes can override balancing strategy, retryable statuses, passive failure statuses, health endpoints, and connect/read/body timeouts
+- the health checker probes each backend on the route override or the global `/health` endpoint
 - only healthy backends stay in the load-balancing pool
 - client headers and bodies are timed out independently from upstream reads
 - request and response bodies are rejected once they exceed configured byte limits
 - safe and idempotent requests can be retried within a bounded total timeout
 - repeated backend failures trigger temporary ejection before active checks recover them
+- slow client uploads, slow upstream response bodies, and partial client disconnects are surfaced through proxy error metrics
 - debug endpoints can be hidden or protected with a bearer token
+- `https://` upstream backends are rejected for now; terminate TLS in a trusted front proxy and forward plain HTTP to `ferrum-proxy`
 
 ## Run it
 
