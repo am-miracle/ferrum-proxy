@@ -39,65 +39,7 @@ src/
 
 ## Config
 
-The proxy reads `config.yaml`.
-
-Example:
-
-```yaml
-server:
-  port: 8080
-  host: 0.0.0.0
-  graceful_shutdown_timeout_ms: 30000
-  client_header_timeout_ms: 10000
-  client_body_timeout_ms: 15000
-
-routes:
-  - path_prefix: /api
-    backends:
-      - http://127.0.0.1:3001
-      - http://127.0.0.1:3002
-      - http://127.0.0.1:3003
-    balancing: round_robin
-    retry_on_statuses: [502, 503, 504]
-    passive_failure_statuses: [500, 502, 503, 504]
-    health_check_endpoint: /ready
-    connect_timeout_ms: 1000
-    read_timeout_ms: 5000
-    client_body_timeout_ms: 3000
-
-  - path_prefix: /static
-    backends:
-      - http://127.0.0.1:4000
-    balancing: first_healthy
-
-health_check:
-  interval_sec: 10
-  endpoint: /health
-  failure_threshold: 3
-  recovery_threshold: 2
-  ejection_duration_ms: 30000
-  active_success_status_min: 200
-  active_success_status_max: 399
-  passive_failure_status_min: 500
-  passive_failure_status_max: 599
-
-upstream:
-  connect_timeout_ms: 3000
-  read_timeout_ms: 15000
-  max_request_body_bytes: 16777216
-  max_response_body_bytes: 67108864
-
-retry:
-  max_attempts: 2
-  total_timeout_ms: 5000
-  backoff_ms: 50
-  retry_on_statuses: [502, 503, 504]
-
-debug:
-  expose_backend_health: true
-  expose_metrics: true
-  auth_token: change-me
-```
+The proxy reads [`config.yaml`](config.yaml).
 
 How it works:
 
