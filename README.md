@@ -21,7 +21,7 @@
 
 This project works and is useful for local testing, learning, and small internal environments.
 
-It is not production-ready yet. The main gaps are documented in [docs/production-readiness.md](docs/production-readiness.md).
+It is not production-ready yet. The remaining gaps are mainly around broader operational hardening, deployment guidance, and more real-world validation.
 
 ## Project layout
 
@@ -224,23 +224,30 @@ cargo run --release --bin benchmark_runner -- --warmup 10s --duration 30s
 cargo run --release --bin benchmark_runner -- --skip-build
 ```
 
-The benchmark output is the native `wrk` report, for example:
+The benchmark output is the native `wrk` report. The `healthy_get` measured pass from the May 24, 2026 run in `benchmark-results/20260524-194445/` looked like:
 
 ```text
-Running 30s test @ http://127.0.0.1:63580/api/users
-  4 threads and 100 connections
+Running 15s test @ http://127.0.0.1:55845/api/users
+  4 threads and 128 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     4.69ms    4.79ms 123.96ms   93.34%
-    Req/Sec     6.24k     1.10k    7.79k    70.51%
+    Latency     4.89ms    7.48ms 117.35ms   95.86%
+    Req/Sec     8.45k     2.16k   11.10k    73.50%
   Latency Distribution
-     50%    3.65ms
-     75%    4.76ms
-     90%    7.33ms
-     99%   25.20ms
-  747182 requests in 30.10s, 0.86GB read
-Requests/sec:  24822.42
-Transfer/sec:     29.43MB
+     50%    3.43ms
+     75%    4.43ms
+     90%    6.38ms
+     99%   41.07ms
+  504964 requests in 15.01s, 581.26MB read
+Requests/sec:  33642.70
+Transfer/sec:     38.73MB
 ```
+
+Latest measured snapshot from May 24, 2026:
+
+- `healthy_get`: `33642.70` requests/sec, `p99 41.07ms`
+- `large_response`: `10430.62` requests/sec, `2.55GB/sec`
+- `retry_get`: `21891.36` requests/sec, `p99 10.80ms`
+- `upload_post`: `18625.54` requests/sec, `p99 9.68ms`
 
 Focus on:
 
@@ -254,4 +261,3 @@ For more detail, see [docs/benchmarking.md](docs/benchmarking.md).
 
 - [docs/architecture.md](docs/architecture.md)
 - [docs/benchmarking.md](docs/benchmarking.md)
-- [docs/production-readiness.md](docs/production-readiness.md)
